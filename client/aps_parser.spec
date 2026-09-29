@@ -102,7 +102,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="EPC Price",
+    name="EPC Price 8.6",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
