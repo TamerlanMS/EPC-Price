@@ -982,6 +982,174 @@ async def pricelist_to_general(
     return {"status": "ok", "added": added, "updated": updated}
 
 
+# ─── Дилерский прайс ───────────────────────────────────────────────────────────
+
+class DealerItem(BaseModel):
+    """Позиция дилерского прайса.
+
+    Цены приходят уже приведёнными: НДС и раскладка по колонкам решаются
+    на клиенте, где менеджер видит переключатели.
+    """
+    key:     str = ""                    # артикул либо «~наименование»
+    article: str = ""
+    name:    str = ""
+    unit:    str = "шт."
+    partner: Optional[float] = None      # «Цена Себес» → закупка
+    kaznisa: Optional[float] = None      # «Цена КП»    → цена продажи
+
+
+class DealerSync(BaseModel):
+    items:    List[DealerItem]
+    load_new: bool = False               # писать новые в общую базу
+
+
+def _dealer_key(article: Optional[str], name: Optional[str]) -> str:
+    """Ключ позиции — тот же, что у импорта базы и у клиента."""
+    a = (article or "").strip()
+    if a:
+        return a.upper()
+    n = " ".join((name or "").split()).lower()
+    return f"~{n}" if n else ""
+
+
+@router.post("/pricelist/dealer-sync")
+async def pricelist_dealer_sync(
+    request: Request,
+    payload: DealerSync,
+    db: AsyncSession = Depends(get_db),
+    _key: str = Depends(verify_api_key),
+    current_user=Depends(get_current_user_optional),
+):
+    """Сверяет дилерский прайс со всеми сегментами.
+
+    Возвращает разбивку «нашлось / новое» и, если load_new, кладёт новые
+    позиции в общую базу (сегмент gen).
+    """
+    require_import_auth(current_user, "")
+
+    items = [i for i in payload.items if _dealer_key(i.article, i.name)]
+    if not items:
+        return {"status": "ok", "stats": {"total": 0}, "matched": [], "new": []}
+
+    from app.services.matcher import article_key
+
+    # ── Индекс по всем активным позициям всех сегментов ──────────────────
+    rows = await db.execute(
+        select(Product.id, Product.article, Product.name, Product.segment,
+               Product.partner, Product.kaznisa)
+        .where(Product.is_active == True)          # noqa: E712
+    )
+    by_key: dict = {}
+    by_akey: dict = {}
+    for pid, art, nm, seg, partner, kaz in rows.all():
+        rec = {"id": pid, "segment": seg, "article": art or "",
+               "name": nm or "", "partner": partner, "kaznisa": kaz}
+        k = _dealer_key(art, nm)
+        if k:
+            by_key.setdefault(k, rec)
+        if art:
+            ak = article_key(art)
+            if ak:
+                by_akey.setdefault(ak, rec)
+
+    matched, fresh = [], []
+    seg_hits: dict = {}
+    for it in items:
+        key = it.key.strip() or _dealer_key(it.article, it.name)
+        hit = by_key.get(key)
+        how = "key"
+        if hit is None and it.article:
+            ak = article_key(it.article)
+            if ak:
+                hit = by_akey.get(ak)
+                how = "article_key"
+        if hit is None:
+            fresh.append(it)
+            continue
+        seg_hits[hit["segment"]] = seg_hits.get(hit["segment"], 0) + 1
+        matched.append({
+            "key":         key,
+            "article":     it.article,
+            "name":        it.name,
+            "segment":     hit["segment"],
+            "how":         how,
+            "db_name":     hit["name"],
+            "old_partner": hit["partner"],
+            "old_kaznisa": hit["kaznisa"],
+            "new_partner": it.partner,
+            "new_kaznisa": it.kaznisa,
+        })
+
+    added = updated = 0
+    if payload.load_new and fresh:
+        # Внутри общей базы позиция опознаётся тем же ключом: повторная
+        # загрузка того же прайса обновит цену, а не создаст дубль
+        gen_rows = await db.execute(
+            select(Product.id, Product.article, Product.name)
+            .where(Product.segment == "gen")
+        )
+        gen_by_key = {}
+        for pid, art, nm in gen_rows.all():
+            k = _dealer_key(art, nm)
+            if k:
+                gen_by_key[k] = pid
+
+        seen: set = set()
+        for it in fresh:
+            key = it.key.strip() or _dealer_key(it.article, it.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            data = dict(
+                article=(it.article or "").strip() or None,
+                name=(it.name or "").strip() or None,
+                unit=(it.unit or "шт.").strip() or "шт.",
+                partner=it.partner,
+                kaznisa=it.kaznisa,
+                segment="gen",
+                is_active=True,
+            )
+            pid = gen_by_key.get(key)
+            if pid:
+                await db.execute(
+                    update(Product).where(Product.id == pid).values(**data)
+                )
+                updated += 1
+            else:
+                db.add(Product(**data))
+                added += 1
+        await db.commit()
+        invalidate_product_cache()
+
+    stats = {
+        "total":    len(items),
+        "matched":  len(matched),
+        "new":      len(fresh),
+        "by_segment": seg_hits,
+        "added":    added,
+        "updated":  updated,
+    }
+
+    ip = request.client.host if request.client else None
+    await write_audit(db, current_user, "pricelist_dealer_sync",
+                      resource="Дилерский прайс",
+                      details=(f"total={len(items)}, matched={len(matched)}, "
+                               f"new={len(fresh)}, added={added}, "
+                               f"updated={updated}"), ip=ip)
+    logger.info("dealer-sync: total=%d matched=%d new=%d added=%d updated=%d by %s",
+                len(items), len(matched), len(fresh), added, updated,
+                getattr(current_user, "username", "?"))
+
+    return {
+        "status":  "ok",
+        "stats":   stats,
+        "matched": matched,
+        "new": [{"key": (i.key.strip() or _dealer_key(i.article, i.name)),
+                 "article": i.article, "name": i.name, "unit": i.unit,
+                 "partner": i.partner, "kaznisa": i.kaznisa} for i in fresh],
+    }
+
+
 # ─── App Settings ──────────────────────────────────────────────────────────────
 
 class AppSettingsUpdate(BaseModel):

@@ -203,7 +203,7 @@ class AuthDialog(ctk.CTkToplevel):
                                            fg_color="transparent")
             self._logo_lbl.pack(side="left", padx=16, pady=10)
         else:
-            self._logo_lbl = ctk.CTkLabel(self._header, text="GQ Group  APS Parser",
+            self._logo_lbl = ctk.CTkLabel(self._header, text="GQ Group  EPC Price",
                                            font=FONT_LOGO, text_color="white")
             self._logo_lbl.pack(side="left", padx=20, pady=12)
 

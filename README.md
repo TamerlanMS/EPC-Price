@@ -107,7 +107,7 @@ pyinstaller aps_parser.spec
 | 7 | `APS-K7-N5eP2bL8wK4rH7mQ1xT9yJ3vF6cS0` 1 Бекшора  |
 | 8 | `APS-K8-H8kQ3mN6tB1rL9eW5xV2yP4jD7sF0` 1 Асылхан  |
 | 9 | `APS-K9-L1xB7eW4mK2rN9pH6tQ8yV3jF5cD0` 1 Улгас    |
-| 10 | `APS-K10-P4yN9vL7bK3wH2mR8xQ5eT1jF6sD0`           |
+| 10 | `APS-K10-P4yN9vL7bK3wH2mR8xQ5eT1jF6sD0` 1 Асель   |
 
 Чтобы отозвать ключ — удалите его из `settings.API_KEYS` в `config.py` и перезапустите сервер.
 

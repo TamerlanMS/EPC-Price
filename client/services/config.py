@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 
-CONFIG_FILE = Path.home() / ".aps_parser" / "config.json"
+CONFIG_FILE = Path.home() / ".epc_price" / "config.json"
+
+# Папка настроек до переименования программы. Читается, если новой ещё нет:
+# иначе после обновления у всех слетели бы адрес сервера, ключ и язык.
+_LEGACY_CONFIG_FILE = Path.home() / ".aps_parser" / "config.json"
 
 
 class AppConfig:
@@ -24,9 +28,10 @@ class AppConfig:
         self.load()
 
     def load(self):
-        if CONFIG_FILE.exists():
+        src = CONFIG_FILE if CONFIG_FILE.exists() else _LEGACY_CONFIG_FILE
+        if src.exists():
             try:
-                d = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                d = json.loads(src.read_text(encoding="utf-8"))
                 self.server_url    = d.get("server_url",    self.server_url)
                 self.api_key       = d.get("api_key",       self.api_key)
                 self.language      = d.get("language",      self.language)

@@ -29,6 +29,9 @@ a = Analysis(
         "services.config",
         "services.api_service",
         "services.excel_generator",
+        "services.dealer_price",
+        "services.dealer_price_report",
+        "xlrd",
 
         "assets",
         "assets.theme",
@@ -99,7 +102,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="GQ-EPC 0.8.4",
+    name="EPC Price",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1483,7 +1483,7 @@ def generate_excel(
     if not tpl:
         raise FileNotFoundError(
             "Шаблон WV_template.xlsm не найден. Поместите его в client/assets/ "
-            "и пересоберите .exe (или скопируйте рядом с APSParser.exe в папку assets)."
+            "и пересоберите .exe (или скопируйте рядом с «EPC Price.exe» в папку assets)."
         )
 
     shutil.copyfile(tpl, out_path)

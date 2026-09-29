@@ -679,6 +679,40 @@ class ApiService:
             updated += data.get("updated", 0)
         return {"status": "ok", "added": added, "updated": updated}
 
+    def dealer_sync(self, items: list, load_new: bool = False,
+                    progress_cb=None) -> dict:
+        """POST /database/pricelist/dealer-sync — сверка дилерского прайса.
+
+        Сверяет позиции со всеми сегментами и, если load_new, кладёт новые
+        в общую базу. Возвращает склеенные итоги и списки для отчёта.
+        """
+        stats = {"total": 0, "matched": 0, "new": 0,
+                 "added": 0, "updated": 0, "by_segment": {}}
+        matched, fresh = [], []
+        CHUNK = 1000
+        total = max(1, len(items))
+        for i in range(0, len(items), CHUNK):
+            r = requests.post(
+                f"{self._base}/api/v1/database/pricelist/dealer-sync",
+                json={"items": items[i:i + CHUNK], "load_new": bool(load_new)},
+                headers=self._h,
+                timeout=600,
+            )
+            self._raise_for_status(r)
+            data = r.json()
+            st = data.get("stats") or {}
+            for k in ("total", "matched", "new", "added", "updated"):
+                stats[k] += st.get(k, 0)
+            for seg, n in (st.get("by_segment") or {}).items():
+                stats["by_segment"][seg] = stats["by_segment"].get(seg, 0) + n
+            matched.extend(data.get("matched") or [])
+            fresh.extend(data.get("new") or [])
+            if progress_cb:
+                done = min(len(items), i + CHUNK)
+                progress_cb(int(done / total * 100),
+                            f"Сверка с базами: {done:,} из {len(items):,}")
+        return {"stats": stats, "matched": matched, "new": fresh}
+
     def compare_pricelist(self, pdf_path: str,
                           segments: Optional[list] = None,
                           threshold: float = 5.0,

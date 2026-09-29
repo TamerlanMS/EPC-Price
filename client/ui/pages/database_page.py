@@ -20,6 +20,15 @@ SMR_KINDS = (
     ("out", "Внутриплощадные сети", "9500"),
 )
 
+# Короткие подписи сегментов для однострочных итогов.
+# Полные названия живут в locales, здесь нужен именно короткий вид.
+SEG_TITLES = {
+    "ss":  "слаботочка",
+    "os":  "освещение",
+    "sil": "силовое",
+    "gen": "общая",
+}
+
 class DropCard(ctk.CTkFrame):
     """Drag-and-drop card for xlsx files."""
     def __init__(self, parent, label_key: str, **kwargs):
@@ -680,7 +689,8 @@ class DatabasePage(ctk.CTkFrame):
                      text_color=NAVY).pack(pady=(12, 0))
         self._pl_drop_lbl = ctk.CTkLabel(
             self._pl_drop,
-            text="📄  Перетащите прейскурант (PDF)\n\nили нажмите для выбора",
+            text="📄  Перетащите прейскурант (PDF)\n"
+                 "или дилерский прайс (.xls / .xlsx)\n\nнажмите для выбора",
             font=FONT_NORMAL, text_color=TEXT_SECONDARY, wraplength=340,
         )
         self._pl_drop_lbl.pack(pady=(10, 6))
@@ -771,6 +781,32 @@ class DatabasePage(ctk.CTkFrame):
         self._pl_seg_labels = _pl_labels
         self._pl_seg_codes  = ["ss", "os", "sil", "all"]
 
+        # ── Переключатели загрузки ──────────────────────────────────────
+        _sw = ctk.CTkFrame(opts, fg_color="transparent")
+        _sw.grid(row=3, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 10))
+
+        self._pl_update_var = ctk.BooleanVar(value=True)
+        self._pl_update_sw = ctk.CTkSwitch(
+            _sw, text="Обновлять цены на имеющиеся позиции",
+            variable=self._pl_update_var, font=FONT_SMALL,
+            progress_color="#1E8449", command=self._pl_on_update_toggle,
+        )
+        self._pl_update_sw.pack(side="left", padx=(0, 24))
+
+        self._pl_vat_var = ctk.BooleanVar(value=False)
+        self._pl_vat_sw = ctk.CTkSwitch(
+            _sw, text="Цены уже с НДС",
+            variable=self._pl_vat_var, font=FONT_SMALL,
+            progress_color="#1E8449",
+        )
+        self._pl_vat_sw.pack(side="left")
+
+        self._pl_mode_lbl = ctk.CTkLabel(
+            _sw, text="", font=FONT_SMALL, text_color=TEXT_SECONDARY,
+            anchor="w", justify="left",
+        )
+        self._pl_mode_lbl.pack(side="left", padx=(20, 0))
+
         ctk.CTkLabel(opts, text="Порог отклонения, %:", font=FONT_SMALL,
                      text_color=TEXT_SECONDARY
                      ).grid(row=1, column=0, padx=(12, 8), pady=(0, 10), sticky="w")
@@ -847,8 +883,11 @@ class DatabasePage(ctk.CTkFrame):
 
     def _pl_browse(self):
         path = filedialog.askopenfilename(
-            title="Выберите прейскурант",
-            filetypes=[("PDF", "*.pdf"), ("Все файлы", "*.*")],
+            title="Выберите прейскурант или дилерский прайс",
+            filetypes=[("Прейскурант / прайс", "*.pdf *.xls *.xlsx *.xlsm"),
+                       ("PDF", "*.pdf"),
+                       ("Excel", "*.xls *.xlsx *.xlsm"),
+                       ("Все файлы", "*.*")],
         )
         if path:
             self._pl_set_file(path)
@@ -863,20 +902,42 @@ class DatabasePage(ctk.CTkFrame):
             path = raw.split()[0] if raw else ""
         if not path:
             return
-        if not path.lower().endswith(".pdf"):
-            messagebox.showwarning("", "Прейскурант должен быть в формате PDF.")
+        if not path.lower().endswith((".pdf", ".xls", ".xlsx", ".xlsm")):
+            messagebox.showwarning(
+                "", "Ожидается прейскурант (PDF) или дилерский прайс "
+                    "(.xls / .xlsx).")
             return
         self._pl_set_file(path)
 
     def _pl_set_file(self, path: str):
         self._pl_path = path
+        self._pl_is_dealer = False
+        self._pl_dealer_result = None      # отчёт прошлого прайса больше не наш
+        if path.lower().endswith((".xls", ".xlsx", ".xlsm")):
+            try:
+                from services.dealer_price import looks_like_dealer_price
+                self._pl_is_dealer = looks_like_dealer_price(path)
+            except Exception as e:
+                print(f"[Прайс/опознание] {e}")
+            if not self._pl_is_dealer:
+                messagebox.showwarning(
+                    "Формат не распознан",
+                    "В файле не найдена таблица с колонками «Наименование» "
+                    "и ценой.\n\nОжидается шапка вида:\n"
+                    "Артикул | Наименование | Ед. изм. | Кол-во | "
+                    "Цена Себес | Цена КП | Цена ГЭ",
+                    parent=self)
+                return
+
+        _kind = "Дилерский прайс" if self._pl_is_dealer else "Прейскурант КазНИИСА"
         self._pl_file_lbl.configure(text=f"✅  {os.path.basename(path)}")
         self._pl_drop.configure(border_color=NAVY_LIGHT, fg_color=BLUE_PALE)
         self._pl_drop_lbl.configure(
-            text="📄  Файл выбран — нажмите «Сверить цены»\n\n"
-                 "или перетащите другой файл",
+            text=f"📄  {_kind}\n\nнажмите, чтобы выбрать другой файл",
         )
-        self._pl_run_btn.configure(state="normal")
+        # Старый режим сверки с БД работает только по прейскуранту PDF
+        self._pl_run_btn.configure(
+            state="disabled" if self._pl_is_dealer else "normal")
         self._pl_sync_buttons()
 
     def _pl_base_browse(self):
@@ -921,16 +982,44 @@ class DatabasePage(ctk.CTkFrame):
         self._pl_sync_buttons()
 
     def _pl_sync_buttons(self):
-        """Режимы сверки доступны только когда выбраны оба файла."""
-        state = "normal" if (self._pl_path and self._pl_base_path) else "disabled"
+        """Что доступно: зависит от файла и от переключателя обновления.
+
+        Без обновления имеющихся база сегмента не нужна — сверка идёт по
+        всем сегментам из БД, и хватает одного прайса.
+        """
+        update = bool(getattr(self, "_pl_update_var", None)
+                      and self._pl_update_var.get())
+        need_base = update
+        ok = bool(self._pl_path) and (bool(self._pl_base_path) or not need_base)
         for b in (self._pl_cmp_btn, self._pl_apply_btn):
-            b.configure(state=state)
+            b.configure(state="normal" if ok else "disabled")
+
+        # Зона базы гаснет, когда она ни на что не влияет
+        if hasattr(self, "_pl_base_drop"):
+            for w in (self._pl_base_lbl, self._pl_base_file_lbl):
+                w.configure(text_color=TEXT_SECONDARY if need_base else "#B0B8BF")
+            self._pl_base_drop.configure(
+                border_color=("#1E8449" if (need_base and self._pl_base_path)
+                              else "#AEB6BF"))
+
+        if hasattr(self, "_pl_mode_lbl"):
+            self._pl_mode_lbl.configure(
+                text=("" if need_base else
+                      "база сегмента не нужна: сверка по всем базам, "
+                      "в общую — только новое"))
+
+    def _pl_on_update_toggle(self):
+        """Переключили обновление цен — меняется и набор нужных файлов."""
+        self._pl_sync_buttons()
 
     def _pl_sync_run(self, apply_changes: bool):
         """Сверка приложенной эксель-базы с прейскурантом.
 
         apply_changes=False — только отчёт, ни файл, ни база не меняются.
         """
+        if getattr(self, "_pl_is_dealer", False):
+            self._pl_dealer_run(apply_changes)
+            return
         if not (self._pl_path and self._pl_base_path):
             return
         if not os.path.isfile(self._pl_base_path):
@@ -980,6 +1069,248 @@ class DatabasePage(ctk.CTkFrame):
             self.after(0, lambda: self._pl_sync_ready(result, apply_changes))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Дилерский прайс ──────────────────────────────────────────────────
+
+    def _pl_dealer_run(self, apply_changes: bool):
+        """Разбор прайса, сверка с базой сегмента и со всеми сегментами БД."""
+        if not self._pl_path:
+            return
+        update = bool(self._pl_update_var.get())
+        vat    = bool(self._pl_vat_var.get())
+        base   = self._pl_base_path if update else ""
+        if update and not base:
+            messagebox.showwarning(
+                "", "Включено обновление цен — приложите эксель-базу сегмента "
+                    "или выключите переключатель.", parent=self)
+            return
+        if base and not os.path.isfile(base):
+            messagebox.showerror("", "Файл базы не найден.")
+            return
+
+        for b in (self._pl_cmp_btn, self._pl_apply_btn, self._pl_run_btn):
+            b.configure(state="disabled")
+        self.progress.grid()
+        self.progress.set(0)
+        self._pl_summary.configure(text="Разбор прайса...",
+                                   text_color=TEXT_SECONDARY)
+
+        def _progress(pct, msg):
+            self.after(0, lambda: (self.progress.set(max(0.0, min(1.0, pct / 100))),
+                                   self._pl_summary.configure(text=msg)))
+
+        def _worker():
+            try:
+                from services.dealer_price import (
+                    parse_dealer_price, read_base_rows_ext,
+                    match_base_to_dealer, prices_of,
+                )
+
+                parsed = parse_dealer_price(
+                    self._pl_path, lambda p_, m: _progress(p_ * 0.2, m))
+                rows = parsed["rows"]
+                if not rows:
+                    raise RuntimeError("В прайсе нет позиций с ценами.")
+
+                stats = {
+                    "dealer_rows":      len(rows),
+                    "skipped_no_price": parsed["skipped_no_price"],
+                    "duplicates":       parsed["duplicates"],
+                }
+
+                # ── Цены в приложенном файле ────────────────────────────
+                changed, sheet = [], ""
+                if base:
+                    _progress(25, "Чтение эксель-базы...")
+                    base_rows, sheet = read_base_rows_ext(base)
+                    if not base_rows:
+                        raise RuntimeError(
+                            "В файле базы не найдено строк. Ожидается лист "
+                            "«БД» с колонками: № | Артикул | Наименование | "
+                            "Ед. | КазНИИСА ...")
+                    m = match_base_to_dealer(
+                        base_rows, rows, vat,
+                        progress_cb=lambda p_, msg: _progress(25 + p_ * 0.35, msg))
+                    changed = m["changed"]
+                    stats.update(m["stats"])
+
+                # ── Что из этого вообще есть в базах ────────────────────
+                _progress(65, "Сверка со всеми сегментами...")
+                items = []
+                for d in rows:
+                    pa, ka = prices_of(d, vat)
+                    items.append({"key": d["key"], "article": d["article"],
+                                  "name": d["name"], "unit": d["unit"],
+                                  "partner": pa, "kaznisa": ka})
+                db = self.api.dealer_sync(
+                    items, load_new=False,
+                    progress_cb=lambda p_, msg: _progress(65 + p_ * 0.35, msg))
+                stats["db_matched"]  = db["stats"]["matched"]
+                stats["by_segment"]  = db["stats"]["by_segment"]
+                stats["new"]         = db["stats"]["new"]
+                stats["added"] = stats["updated"] = 0
+
+                result = {"stats": stats, "changed": changed,
+                          "found": db["matched"], "new": db["new"],
+                          "sheet": sheet, "vat": vat, "update": update,
+                          "base": base}
+            except Exception as e:
+                self.after(0, lambda err=e: self._pl_sync_failed(err))
+                return
+            self.after(0, lambda: self._pl_dealer_ready(result, apply_changes))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _pl_dealer_ready(self, result: dict, apply_changes: bool):
+        """Итоги разбора; при «Применить» — запись цен и загрузка новых."""
+        st = result["stats"]
+        self.progress.set(1.0)
+        self._pl_dealer_result = result
+        self._pl_result = None
+        self._pl_sync_result = None
+        self._pl_save_btn.configure(state="normal")
+
+        seg_txt = ", ".join(
+            f"{SEG_TITLES.get(k, k)} {v:,}"
+            for k, v in sorted((st.get("by_segment") or {}).items(),
+                               key=lambda kv: -kv[1]))
+        head = (f"Позиций в прайсе: {st['dealer_rows']:,}   |   "
+                f"есть в базах: {st.get('db_matched', 0):,}"
+                + (f"  ({seg_txt})" if seg_txt else "")
+                + f"   |   новых: {st.get('new', 0):,}")
+        if st.get("base_rows"):
+            head += (f"\nВ приложенной базе сопоставлено {st['matched']:,} "
+                     f"(артикул {st['by_article']:,}, наименование "
+                     f"{st['by_name']:,})   |   цена изменится у "
+                     f"{st['changed']:,}   |   совпадает у {st['unchanged']:,}")
+        if st.get("duplicates") or st.get("skipped_no_price"):
+            head += (f"\nПропущено: без цены {st.get('skipped_no_price', 0):,}, "
+                     f"дублей в прайсе {st.get('duplicates', 0):,}")
+
+        self._pl_summary.configure(text=head, text_color=NAVY)
+
+        if not apply_changes:
+            self.progress.grid_remove()
+            self._pl_sync_buttons()
+            self._pl_summary.configure(
+                text="📋  ТОЛЬКО СРАВНЕНИЕ — ничего не изменено\n" + head,
+                text_color=NAVY)
+            self._pl_dealer_report(result, applied=False, backup="", loaded=False)
+            return
+
+        _lines = []
+        if result["update"] and st.get("changed"):
+            _lines.append(f"Будет изменено цен в файле: {st['changed']:,}")
+            _lines.append(f"Файл: {os.path.basename(result['base'])}")
+            _lines.append("Перед изменением рядом будет создана копия "
+                          "с текущей датой.")
+        _lines.append(f"Будет загружено в общую базу: {st.get('new', 0):,}")
+        _lines.append("")
+        _lines.append("Цены в прайсе: "
+                      + ("уже с НДС" if result["vat"] else "без НДС, умножим на 1.16"))
+        if not messagebox.askyesno("Применить изменения",
+                                   "\n".join(_lines) + "\n\nПродолжить?",
+                                   icon="warning", parent=self):
+            self.progress.grid_remove()
+            self._pl_sync_buttons()
+            self._pl_summary.configure(text=head + "\n\nИзменения не применялись.",
+                                       text_color=TEXT_SECONDARY)
+            return
+
+        self.progress.set(0)
+        self._pl_summary.configure(text="Запись цен и загрузка новых позиций...",
+                                   text_color=TEXT_SECONDARY)
+
+        def _worker():
+            backup, written, loaded = "", 0, False
+            try:
+                from services.dealer_price import write_dealer_prices_to_base
+                from services.pricelist_sync import make_dated_backup
+
+                if result["update"] and result["changed"]:
+                    self.after(0, lambda: self._pl_summary.configure(
+                        text="Создание копии и запись цен..."))
+                    backup = make_dated_backup(result["base"])
+                    _wr = write_dealer_prices_to_base(
+                        result["base"], result["changed"], result.get("sheet", ""))
+                    written = _wr["written"]
+                    result["_formula_cells"] = _wr["formula_cells"]
+
+                if result["new"]:
+                    self.after(0, lambda: self._pl_summary.configure(
+                        text=f"Загрузка {len(result['new']):,} поз. "
+                             f"в общую базу..."))
+                    res = self.api.dealer_sync(result["new"], load_new=True)
+                    result["stats"]["added"]   = res["stats"]["added"]
+                    result["stats"]["updated"] = res["stats"]["updated"]
+                    loaded = True
+            except Exception as e:
+                self.after(0, lambda err=e, b=backup: self._pl_apply_failed(err, b))
+                return
+            self.after(0, lambda: self._pl_dealer_applied(
+                result, written, backup, loaded))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _pl_dealer_applied(self, result: dict, written: int,
+                           backup: str, loaded: bool):
+        self.progress.set(1.0)
+        self.progress.grid_remove()
+        self._pl_sync_buttons()
+        self._refresh_count()
+        self._load_brand_stats()
+
+        st  = result["stats"]
+        _fc = result.get("_formula_cells", 0)
+        txt = (f"✅  Обновлено цен в файле: {written:,}   |   "
+               f"в общую базу добавлено {st.get('added', 0):,}, "
+               f"обновлено {st.get('updated', 0):,}")
+        if backup:
+            txt += f"\nКопия до изменений: {os.path.basename(backup)}"
+        if _fc:
+            txt += (f"\n⚠  В файле {_fc:,} ячеек с формулами — откройте его "
+                    f"в Excel и сохраните, иначе импорт увидит их пустыми.")
+        self._pl_summary.configure(text=txt,
+                                   text_color="#B9770E" if _fc else "#1E8449")
+
+        if _fc:
+            messagebox.showwarning(
+                "Файл нужно пересохранить в Excel",
+                f"Цены записаны, но в колонках базы {_fc:,} ячеек заданы "
+                f"формулами.\n\nОткройте файл в Excel и сохраните (Ctrl+S) "
+                f"перед загрузкой базы на сервер.",
+                parent=self)
+
+        self._pl_dealer_report(result, applied=True, backup=backup, loaded=loaded)
+
+    def _pl_dealer_report(self, result: dict, applied: bool,
+                          backup: str, loaded: bool):
+        """Отчёт ложится рядом с прайсом и предлагается к открытию."""
+        try:
+            from services.dealer_price_report import (
+                build_dealer_report, default_report_path,
+            )
+            out = default_report_path(self._pl_path)
+            build_dealer_report(
+                out, result["stats"], os.path.basename(self._pl_path),
+                changed=result.get("changed"),
+                found=result.get("found"),
+                to_general=result.get("new"),
+                base_path=result.get("base", ""),
+                applied=applied, backup=backup, loaded=loaded,
+                vat_included=result.get("vat", False),
+                update_existing=result.get("update", True),
+            )
+            self._pl_dealer_report_path = out
+            if messagebox.askyesno(
+                    "Отчёт готов",
+                    f"Отчёт сохранён рядом с прайсом:\n{out}\n\nОткрыть?",
+                    parent=self):
+                self._pl_open_file(out)
+        except Exception as e:
+            print(f"[Отчёт/дилерский прайс] {e}")
+            messagebox.showwarning("Отчёт", f"Не удалось собрать отчёт: {e}",
+                                   parent=self)
 
     def _pl_sync_failed(self, exc: Exception):
         self.progress.grid_remove()
@@ -1285,6 +1616,35 @@ class DatabasePage(ctk.CTkFrame):
             messagebox.showwarning("", f"Не удалось открыть файл: {e}")
 
     def _pl_save_report(self):
+        # Дилерский прайс — отдельный отчёт со своим набором листов
+        if getattr(self, "_pl_dealer_result", None):
+            res = self._pl_dealer_result
+            path = filedialog.asksaveasfilename(
+                title="Сохранить отчёт сверки",
+                defaultextension=".xlsx",
+                initialfile="Сверка дилерского прайса.xlsx",
+                filetypes=[("Excel", "*.xlsx")],
+            )
+            if not path:
+                return
+            try:
+                from services.dealer_price_report import build_dealer_report
+                build_dealer_report(
+                    path, res["stats"], os.path.basename(self._pl_path),
+                    changed=res.get("changed"),
+                    found=res.get("found"),
+                    to_general=res.get("new"),
+                    base_path=res.get("base", ""),
+                    applied=False, backup="", loaded=False,
+                    vat_included=res.get("vat", False),
+                    update_existing=res.get("update", True),
+                )
+            except Exception as e:
+                messagebox.showerror("Ошибка сохранения", str(e), parent=self)
+                return
+            messagebox.showinfo("Отчёт сохранён", f"Файл: {path}", parent=self)
+            return
+
         # После сверки с эксель-базой сохраняем её отчёт, а не отчёт по БД
         if getattr(self, "_pl_sync_result", None):
             path = filedialog.asksaveasfilename(

@@ -3,7 +3,7 @@
 STRINGS = {
     "ru": {
         # App
-        "app_title": "GQ-EPC — Обработка спецификаций",
+        "app_title": "EPC Price — Обработка спецификаций",
         "app_subtitle": "GQ Group",
         "lang_switch": "ҚАЗ",
 
@@ -477,7 +477,7 @@ STRINGS = {
 
     "kz": {
         # App
-        "app_title": "GQ-EPC — Сипаттамаларды өңдеу",
+        "app_title": "EPC Price — Сипаттамаларды өңдеу",
         "app_subtitle": "GQ Group",
         "lang_switch": "РУС",
 
