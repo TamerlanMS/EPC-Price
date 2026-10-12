@@ -44,9 +44,12 @@ _NAME_MIN_LEN = 20
 # coverage = 1/3 = 0.33 < 0.40 -> rejected even if partial_ratio = 100.
 _WORD_COVERAGE_MIN = 0.40
 
-# KazNIISA codes must have exactly 10 digits (format XXX-XXX-XXXX).
-# Codes with fewer or more digits are arbitrary placeholders -- skip them.
-_KAZNISA_DIGITS_REQUIRED = 10
+# Коды АГСК встречаются в двух формах: XXX-XXX-XXXX (10 цифр) и
+# XXX-XXX-XXXX-XXXX (14 цифр). Раньше проверялось «ровно 10 цифр», и вторая
+# форма не совпадала никогда, хотя в базе слаботочки её каждый четвёртый код.
+# Проверка формы отсекает случайные «1», «12» из колонки кода не хуже счёта
+# цифр, но не выбрасывает вместе с ними настоящие четырёхгрупповые коды.
+_KAZNISA_CODE_RE = re.compile(r"^\d{3}-\d{3}-\d{3,4}(?:-\d{3,4})?$")
 
 # Known brand names that PDF designers append to article numbers.
 # E.g. "ВА47-29 1Р 16А IEK" -> try also "ВА47-29 1Р 16А" without the brand.
@@ -410,7 +413,7 @@ def find_candidates(
     Matching priority:
       1.  Exact article match         (O(1) -- authoritative)
       1b. Exact article after brand-suffix strip  ('ВА47-29 IEK' -> 'ВА47-29')
-      1c. Exact KazNIISA code match   (O(1) -- only 10-digit codes, only when article missing)
+      1c. Exact KazNIISA code match   (O(1) -- коды формы XXX-XXX-XXXX[-XXXX])
       2.  Substring / fuzzy article   (O(n) -- model numbers, tries stripped variant too)
       2d. Cyrillic-stripped article match (only when strip_cyrillic=True, e.g. os segment)
       3.  Name-based fallback         (O(n) -- only when article gives nothing)
@@ -449,12 +452,14 @@ def find_candidates(
     # Tried even when article is present: vendor article codes often differ between
     # the spec and the DB (e.g. WV 0001.X os-segment uses numeric GQ article IDs),
     # so a KazNIISA code match is authoritative and should not be skipped.
-    # Guard: the code must contain EXACTLY 10 digits (standard format XXX-XXX-XXXX).
-    # Codes with fewer/more digits are arbitrary placeholders -- skip them entirely.
+    # Guard: код должен иметь форму АГСК — XXX-XXX-XXXX либо
+    # XXX-XXX-XXXX-XXXX. Всё прочее в колонке кода это мусор вроде «1» или
+    # «Лист», и такие значения совпадать не должны.
     if kaznisa_code_raw:
-        norm_code_q  = normalize(kaznisa_code_raw)
-        _digits_only = re.sub(r'\D', '', norm_code_q)
-        if len(_digits_only) == _KAZNISA_DIGITS_REQUIRED and norm_code_q in index.code_exact:
+        # Пробелы внутри кода встречаются после распознавания: «541- 503».
+        # Склеиваем их до проверки формы, иначе код отбрасывается ни за что.
+        norm_code_q = re.sub(r"\s+", "", normalize(kaznisa_code_raw))
+        if _KAZNISA_CODE_RE.match(norm_code_q) and norm_code_q in index.code_exact:
             for i in index.code_exact[norm_code_q]:
                 candidates.append({"product": products[i], "score": EXACT_SCORE, "method": "code_exact"})
             return candidates[:1]

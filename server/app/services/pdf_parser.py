@@ -1812,6 +1812,12 @@ def _extract_project_name_ai_vision(jpeg_bytes: bytes) -> str:
         return ""
 
 
+# «Поз» как начало слова, в каком бы виде ячейка ни пришла из PDF:
+# «поз.», «поз⏎», «поз », «позиция», «позици⏎я», «пози-⏎ция».
+# Слова, где «поз» — просто первые буквы («позже», «поздно»), не в счёт.
+_POZ_RE = re.compile(r"(?<![а-яё])поз(?:\.|ици|и[-\u00ad]|(?![а-яё]))")
+
+
 def _is_spec_page_text(page_text: str) -> bool:
     """Return True if the page text indicates this page contains the equipment
     specification (Спецификация Оборудования / .СО sheet type).
@@ -1836,7 +1842,7 @@ def _is_spec_page_text(page_text: str) -> bool:
 
     # "поз." / "поз " — traditional abbreviation; "позиция" — full word (used
     # in some project templates, e.g. "6_8.1" series from ТехСтройПроект).
-    has_poz  = "поз." in tl or "поз " in tl or "позиция" in tl
+    has_poz  = bool(_POZ_RE.search(tl))
     has_naim = "наименование" in tl
     has_kol  = ("кол-во" in tl or "количество" in tl
                or "кол." in tl or "коли-" in tl or "кол-" in tl)
@@ -1873,11 +1879,49 @@ def _is_spec_page_text(page_text: str) -> bool:
     # repeat "Спецификация оборудования".  The article column "Тип, марка,
     # обозначение" is very spec-specific — using it as an extra guard prevents
     # false matches on cable-journal or drawing-list pages.
-    has_type_col = "тип, марка" in tl or "тип,марка" in tl or "тип марка" in tl
+    has_type_col = ("тип, марка" in tl or "тип,марка" in tl or "тип марка" in tl
+                    or "код продукции" in tl or "обозначение документа" in tl)
     if has_poz and has_naim and has_kol and has_type_col:
         return True
 
     return False
+
+
+# Обозначение документа в штампе: «1827-2026-2-АПС.СО», «066/2024-АПТ.СО».
+# Латинская «CO» встречается вместо кириллической — ловим обе.
+_SPEC_DESIG_RE = re.compile(r"[\w\-/]+\.с[оo](?![а-яёa-z])")
+
+
+def _spec_designations(page_text: str) -> set:
+    return set(_SPEC_DESIG_RE.findall((page_text or "").lower()))
+
+
+def _propagate_spec_pages(page_texts: List[str], spec_indices: List[int]) -> List[int]:
+    """Добавляет листы-продолжения принятых листов спецификации.
+
+    Лист считается продолжением, если он стоит вплотную к принятому (или к
+    уже добавленному продолжению), несёт то же обозначение документа .СО и
+    содержит слово «наименование» — то есть шапку таблицы.
+
+    Требование соседства принципиально: ведомость рабочих чертежей в начале
+    альбома упоминает то же обозначение, но спецификацией не является.
+    Листы только добавляются, никогда не убираются.
+    """
+    accepted = set(spec_indices)
+    for start in sorted(spec_indices):
+        des = _spec_designations(page_texts[start])
+        if not des:
+            continue
+        for step in (1, -1):
+            j = start + step
+            while 0 <= j < len(page_texts) and j not in accepted:
+                tj = (page_texts[j] or "").lower()
+                if (_spec_designations(tj) & des) and "наименование" in tj:
+                    accepted.add(j)
+                    j += step
+                else:
+                    break
+    return sorted(accepted)
 
 
 def parse_pdf_specification(
@@ -2012,6 +2056,14 @@ def parse_pdf_specification(
                 except Exception:
                     page_texts.append("")
             _text_executor.shutdown(wait=False)
+
+        # ── Phase 1b: листы-продолжения по обозначению документа ──────────
+        if spec_indices and len(page_texts) == total_pages:
+            _extended = _propagate_spec_pages(page_texts, spec_indices)
+            if len(_extended) > len(spec_indices):
+                logger.info("parse_pdf: continuation sheets added: %s",
+                            [i + 1 for i in _extended if i not in spec_indices])
+            spec_indices = _extended
 
         # ── Fallback: process all pages when no spec markers found ──────────
         if spec_indices:
