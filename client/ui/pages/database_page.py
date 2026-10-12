@@ -914,19 +914,30 @@ class DatabasePage(ctk.CTkFrame):
         self._pl_is_dealer = False
         self._pl_dealer_result = None      # отчёт прошлого прайса больше не наш
         if path.lower().endswith((".xls", ".xlsx", ".xlsm")):
+            _why = ""
             try:
-                from services.dealer_price import looks_like_dealer_price
-                self._pl_is_dealer = looks_like_dealer_price(path)
+                from services.dealer_price import inspect_dealer_price
+                self._pl_is_dealer, _why = inspect_dealer_price(path)
             except Exception as e:
+                _why = str(e)
                 print(f"[Прайс/опознание] {e}")
             if not self._pl_is_dealer:
-                messagebox.showwarning(
-                    "Формат не распознан",
-                    "В файле не найдена таблица с колонками «Наименование» "
-                    "и ценой.\n\nОжидается шапка вида:\n"
-                    "Артикул | Наименование | Ед. изм. | Кол-во | "
-                    "Цена Себес | Цена КП | Цена ГЭ",
-                    parent=self)
+                # Причина есть — значит файл не удалось прочитать, и беда не
+                # в его формате. Показываем именно её: «формат не распознан»
+                # отправляет искать ошибку не там.
+                if _why:
+                    messagebox.showerror(
+                        "Не удалось прочитать файл",
+                        f"{_why}\n\nФайл: {os.path.basename(path)}",
+                        parent=self)
+                else:
+                    messagebox.showwarning(
+                        "Формат не распознан",
+                        "В файле не найдена таблица с колонками "
+                        "«Наименование» и ценой.\n\nОжидается шапка вида:\n"
+                        "Артикул | Наименование | Ед. изм. | Кол-во | "
+                        "Цена Себес | Цена КП | Цена ГЭ",
+                        parent=self)
                 return
 
         _kind = "Дилерский прайс" if self._pl_is_dealer else "Прейскурант КазНИИСА"

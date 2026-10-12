@@ -123,8 +123,13 @@ def _read_xls(path: str) -> Tuple[str, List[list]]:
         import xlrd
     except ImportError as e:
         raise RuntimeError(
-            "Для файлов .xls нужен модуль xlrd. Установите его "
-            "(pip install xlrd) или пересохраните прайс в .xlsx."
+            "Старый формат .xls читается модулем xlrd, а он не установлен.\n\n"
+            "Самое быстрое решение: откройте прайс в Excel и сохраните как "
+            "«Книга Excel (*.xlsx)» — такой файл приложение читает само.\n\n"
+            "Чтобы принимать .xls напрямую, нужно доустановить модуль и "
+            "пересобрать приложение — из папки client:\n"
+            "    pip install xlrd\n"
+            "    pyinstaller aps_parser.spec --clean --noconfirm"
         ) from e
 
     wb = xlrd.open_workbook(path)
@@ -181,16 +186,34 @@ def _find_header(rows: List[list]) -> Tuple[int, Dict[str, int]]:
     return best_i, best_map
 
 
-def looks_like_dealer_price(path: str) -> bool:
-    """Похож ли файл на дилерский прайс. Ошибки чтения — это «нет»."""
-    if os.path.splitext(path)[1].lower() not in (".xls", ".xlsx", ".xlsm"):
-        return False
+def inspect_dealer_price(path: str) -> Tuple[bool, str]:
+    """Похож ли файл на дилерский прайс. Возвращает (да/нет, причина).
+
+    Причина возвращается, а не проглатывается, потому что «не распознан»
+    и «не смог прочитать» — разные беды с разным лечением. Отсутствие
+    модуля xlrd выглядело в интерфейсе как неподходящий формат файла, и
+    менеджер искал ошибку в прайсе вместо того, чтобы доустановить
+    зависимость.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".xls", ".xlsx", ".xlsm"):
+        return False, f"Неподдерживаемое расширение файла: {ext or '—'}."
     try:
         _sheet, rows = _read_any(path)
-    except Exception:
-        return False
+    except Exception as e:
+        return False, str(e) or e.__class__.__name__
+    if not rows:
+        return False, "Файл пустой: на первом листе нет ни одной строки."
     i, _m = _find_header(rows)
-    return i >= 0
+    if i < 0:
+        return False, ""        # пустая причина — шапка не опознана
+    return True, ""
+
+
+def looks_like_dealer_price(path: str) -> bool:
+    """Короткая форма проверки для мест, где причина не нужна."""
+    ok, _why = inspect_dealer_price(path)
+    return ok
 
 
 # ─── Разбор ──────────────────────────────────────────────────────────────────
