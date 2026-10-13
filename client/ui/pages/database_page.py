@@ -726,7 +726,7 @@ class DatabasePage(ctk.CTkFrame):
         self._pl_base_lbl = ctk.CTkLabel(
             self._pl_base_drop,
             text="📊  Перетащите эксель-базу (.xlsx / .xlsm)\n\n"
-                 "необязательно — без неё сверка идёт с БД",
+                 "нужна, если включено «Обновлять цены\nна имеющиеся позиции»",
             font=FONT_NORMAL, text_color=TEXT_SECONDARY, wraplength=340,
         )
         self._pl_base_lbl.pack(pady=(10, 6))
@@ -797,7 +797,7 @@ class DatabasePage(ctk.CTkFrame):
         self._pl_vat_sw = ctk.CTkSwitch(
             _sw, text="Цены уже с НДС",
             variable=self._pl_vat_var, font=FONT_SMALL,
-            progress_color="#1E8449",
+            progress_color="#1E8449", command=self._pl_sync_buttons,
         )
         self._pl_vat_sw.pack(side="left")
 
@@ -845,14 +845,15 @@ class DatabasePage(ctk.CTkFrame):
         )
         self._pl_apply_btn.pack(side="left")
 
-        ctk.CTkLabel(
+        self._pl_hint_lbl = ctk.CTkLabel(
             _sync,
             text="  Цены обновляются в приложенном файле (сметная × 1.16 → "
                  "колонка «КазНИИСА»),\n  несовпавшие позиции прейскуранта "
                  "идут в общую базу.",
             font=FONT_SMALL, text_color=TEXT_SECONDARY,
             anchor="w", justify="left",
-        ).pack(side="left", padx=(10, 0))
+        )
+        self._pl_hint_lbl.pack(side="left", padx=(10, 0))
 
         # ── Результаты ───────────────────────────────────────────────────────
         res = ctk.CTkFrame(tab, fg_color=BG_CARD, corner_radius=RADIUS_MD)
@@ -988,7 +989,7 @@ class DatabasePage(ctk.CTkFrame):
         self._pl_base_drop.configure(border_color="#AEB6BF", fg_color=BG_CARD)
         self._pl_base_lbl.configure(
             text="📊  Перетащите эксель-базу (.xlsx / .xlsm)\n\n"
-                 "необязательно — без неё сверка идёт с БД")
+                 "нужна, если включено «Обновлять цены\nна имеющиеся позиции»")
         self._pl_base_clear_btn.pack_forget()
         self._pl_sync_buttons()
 
@@ -1013,11 +1014,41 @@ class DatabasePage(ctk.CTkFrame):
                 border_color=("#1E8449" if (need_base and self._pl_base_path)
                               else "#AEB6BF"))
 
+        # Почему кнопки серые — говорим прямо, рядом с переключателем
         if hasattr(self, "_pl_mode_lbl"):
-            self._pl_mode_lbl.configure(
-                text=("" if need_base else
-                      "база сегмента не нужна: сверка по всем базам, "
-                      "в общую — только новое"))
+            if not self._pl_path:
+                _txt, _col = "", TEXT_SECONDARY
+            elif need_base and not self._pl_base_path:
+                _txt = ("⚠  Приложите базу сегмента — или выключите «Обновлять "
+                        "цены», чтобы загрузить только новые позиции")
+                _col = "#B9770E"
+            elif need_base:
+                _txt = ("цены обновятся в приложенной базе, новые позиции — "
+                        "в общую")
+                _col = TEXT_SECONDARY
+            else:
+                _txt = ("база сегмента не нужна: сверка по всем базам, "
+                        "в общую — только новое")
+                _col = TEXT_SECONDARY
+            self._pl_mode_lbl.configure(text=_txt, text_color=_col)
+
+        # Пояснение у кнопок — под тип файла и режим
+        if hasattr(self, "_pl_hint_lbl"):
+            if getattr(self, "_pl_is_dealer", False):
+                _vat = ("как есть" if getattr(self, "_pl_vat_var", None)
+                        and self._pl_vat_var.get() else "× 1.16")
+                _how = ("  «Цена Себес» → «Партнёр», «Цена КП» → «КазНИИСА» "
+                        f"({_vat}).\n")
+                _how += ("  Цены обновляются в приложенной базе; позиции, "
+                         "которых нет ни в одной базе, — в общую."
+                         if need_base else
+                         "  В общую базу загружаются только позиции, "
+                         "которых нет ни в одной базе.")
+            else:
+                _how = ("  Цены обновляются в приложенном файле (сметная × 1.16 → "
+                        "колонка «КазНИИСА»),\n  несовпавшие позиции прейскуранта "
+                        "идут в общую базу.")
+            self._pl_hint_lbl.configure(text=_how)
 
     def _pl_on_update_toggle(self):
         """Переключили обновление цен — меняется и набор нужных файлов."""
