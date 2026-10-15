@@ -340,7 +340,7 @@ async def pinecone_reconnect(
 
 @router.post("/vectorize")
 async def start_vectorization(
-    segment: Optional[str] = Query(default=None, description="Сегмент для векторизации: ss/os/sil или all"),
+    segment: Optional[str] = Query(default=None, description="Сегмент для векторизации: ss/os/sil/gen или all"),
     _key: str = Depends(verify_api_key),
     current_user=Depends(get_current_user_optional),
 ):
@@ -356,9 +356,13 @@ async def start_vectorization(
 
     from app.core.database import AsyncSessionLocal
     from app.services.embedder import embed_products_batch, get_budget_snapshot
-    from app.models.models import ALL_SEGMENTS
+    # KNOWN_SEGMENTS, а не ALL_SEGMENTS: второй — это раскрытие «all» при
+    # подборе, и общей базы в нём намеренно нет. Для векторизации она нужна:
+    # без неё раздел products_gen пуст и смысловой поиск по общей базе
+    # не находит ничего.
+    from app.models.models import KNOWN_SEGMENTS
 
-    segs = ALL_SEGMENTS if (not segment or segment == "all") else [segment]
+    segs = KNOWN_SEGMENTS if (not segment or segment == "all") else [segment]
 
     # Accumulate results from all segments for progress tracking
     _results: list[dict] = []

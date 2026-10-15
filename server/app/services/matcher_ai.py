@@ -30,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.models import Product
 from app.services.matcher import (
+    article_key,
+    _HOMOGLYPHS,
     match_items as classic_match_items,
     product_to_dict,
     _ProductIndex,
@@ -59,6 +61,158 @@ VECTOR_TOP_K = 8
 # Classic fuzzy score below this is "unreliable" — even if AI finds something
 # at VECTOR_MIN_SCORE, we keep the match but flag it as low-confidence
 CLASSIC_FUZZY_WEAK = 82
+
+
+# ── Общая база: свой порог и подтверждение ───────────────────────────────────
+#
+# Порог смыслового сходства для общей базы ниже обычного, но кандидат
+# принимается только с подтверждением артикулом или ключевыми параметрами.
+# Откалибровано на 5 000 позициях дилерского прайса.
+GEN_VECTOR_MIN_SCORE = 0.60
+GEN_TOP_K            = 10
+# Доля параметров позиции, которые должны совпасть (от меньшей из двух сторон:
+# в спецификации параметров обычно больше, чем в строке прайса)
+GEN_KEY_COVERAGE     = 0.67
+
+# Двойники в обоих регистрах: исходная таблица знает только заглавные
+_HOMO_ANY = dict(_HOMOGLYPHS)
+_HOMO_ANY.update({ord(chr(k).lower()): v.lower() for k, v in _HOMOGLYPHS.items()})
+
+# Стандарты — не параметры позиции: «ГОСТ 32397-2013» есть у половины щитов
+_STD_RE   = re.compile(r"(?:гост|ту|iec|ст\s*рк|снип|din)\s*[\w\-.:/]+", re.I)
+_TOK_RE   = re.compile(r"[a-zа-яё0-9][a-zа-яё0-9,.\-/х*]*", re.I)
+# «16 А» → «16а»: единица, отбитая пробелом, прилипает к числу
+_UNIT_RE  = re.compile(r"(\d)\s+(ква|квт|вт|ка|ма|мм|гц|ач|а|в|р|м|п)(?![а-яёa-z])")
+# Диаметр: «d16», «d=16», «д.16», «ø16», «диаметром 16» → «d16»
+_DIAM_RE  = re.compile(
+    r"(?:(?<![a-zа-яё])диаметр(?:ом|а)?|(?<![a-zа-яё])[dдøф])\s*[=.]?\s*(?=\d)")
+_DIAM_MM  = re.compile(r"\bd(\d+(?:[.,]\d+)?)\s*мм")
+
+
+def _key_tokens(text: str) -> set:
+    """Ключевые параметры позиции: числа с единицами и размеры."""
+    s = _STD_RE.sub(" ", str(text or ""))
+    s = s.translate(_HOMO_ANY).lower()          # сначала двойники, потом регистр
+    s = s.replace("×", "х").replace("*", "х")
+    s = re.sub(r"(?<=\d)\s*[xх]\s*(?=\d)", "х", s)
+    s = _DIAM_RE.sub("d", s)
+    s = _DIAM_MM.sub(r"d\1", s)
+    s = _UNIT_RE.sub(r"\1\2", s)
+    out = set()
+    for tok in _TOK_RE.findall(s):
+        tok = tok.strip(".,-/")
+        if not re.search(r"\d", tok) or len(tok) < 2:
+            continue
+        tok = tok.replace(",", ".")
+        if re.fullmatch(r"(19|20)\d\d", tok):  # год
+            continue
+        out.add(tok)
+    return out
+
+
+def _strong_token(tok: str) -> bool:
+    """Параметр, которого одного достаточно: число с единицей или размер,
+    а не голое число."""
+    return len(tok) >= 3 and bool(re.search(r"[a-zа-яёх.]", tok))
+
+
+def _gen_corroborate(q_article: str, q_text: str,
+                     c_article: str, c_name: str) -> tuple:
+    """Подтверждён ли смысловой кандидат из общей базы. (да/нет, чем)."""
+    qk = article_key(q_article) if q_article else ""
+    if qk:
+        ck = article_key(c_article) if c_article else ""
+        if ck and (qk == ck or qk in ck or ck in qk):
+            return True, "артикул"
+        cn = article_key(c_name) or ""
+        if len(qk) >= 6 and qk in cn:
+            return True, "артикул в наименовании"
+
+    qt = _key_tokens(f"{q_article} {q_text}")
+    ct = _key_tokens(f"{c_article} {c_name}")
+    shared = qt & ct
+    small = min(len(qt), len(ct))
+    if not shared or not small or len(shared) < GEN_KEY_COVERAGE * small:
+        return False, ""
+    if len(shared) == 1 and not _strong_token(next(iter(shared))):
+        return False, ""
+    return True, "параметры " + ", ".join(sorted(shared))
+
+
+def _row_to_product(row) -> Dict:
+    return {
+        "id":           row["id"],
+        "article":      (row["article"] or "").strip(),
+        "name":         (row["name"] or "").strip(),
+        "unit":         (row["unit"] or "шт.").strip(),
+        "brand":        (row["brand"] or "").strip(),
+        "kaznisa":      row["kaznisa"],
+        "rrts":         row["rrts"],
+        "mrc":          row["mrc"],
+        "opt":          row["opt"],
+        "partner":      row["partner"],
+        "multiplicity": row["multiplicity"],
+        "kaznisa_code": (row["kaznisa_code"] or "").strip(),
+    }
+
+
+async def _gen_relaxed_match(
+    item: Dict,
+    db: AsyncSession,
+    query_vec: Optional[List[float]],
+) -> Optional[Dict]:
+    """Подбор в общей базе по смыслу с подтверждением. None — не нашлось."""
+    article_raw = item.get("article_raw", "") or ""
+    name_raw    = item.get("name_raw", "") or ""
+    tech_params = item.get("tech_params") or {}
+    tech_text   = tech_params_to_text(tech_params)
+
+    if query_vec is None:
+        q = _product_text(article_raw, name_raw)
+        if tech_text:
+            q = f"{q} {tech_text}".strip()
+        if not q.strip():
+            return None
+        try:
+            query_vec = await embed_text(q)
+        except Exception as exc:
+            logger.warning("gen fallback: embed failed: %s", exc)
+            return None
+
+    cands = await _vector_search(query_vec, db, top_k=GEN_TOP_K, segments=["gen"])
+    q_text = f"{name_raw} {tech_text}".strip()
+
+    for c in cands:                       # уже отсортированы по сходству
+        sim = float(c.get("similarity", 0))
+        if sim < GEN_VECTOR_MIN_SCORE:
+            break
+        ok, why = _gen_corroborate(article_raw, q_text,
+                                   c.get("article", ""), c.get("name", ""))
+        if not ok:
+            continue
+        res = await db.execute(
+            text("SELECT * FROM products WHERE id = :pid AND is_active = true"),
+            {"pid": c["id"]},
+        )
+        row = res.mappings().first()
+        if row is None or (row.get("segment") or "") != "gen":
+            continue
+        product = _row_to_product(row)
+        return {
+            **item,
+            "status":            "ai_match",
+            "match_method":      "ai_gen",
+            "best_match":        product,
+            "candidates":        [{**product, "score": round(sim * 100),
+                                   "method": "vector_gen"}],
+            "ai_used":           True,
+            "ai_confidence":     round(sim, 3),
+            # Всегда на проверку: порог ниже обычного
+            "ai_low_confidence": True,
+            "ai_reason":         f"Общая база: смысловое сходство {sim:.0%}, "
+                                 f"совпали {why}",
+        }
+    return None
 
 
 # ── Vector search via Pinecone ────────────────────────────────────────────────
@@ -184,6 +338,37 @@ async def _gpt_rerank(
 # ── Per-item AI matching ───────────────────────────────────────────────────────
 
 async def _match_one_ai(
+    item: Dict,
+    classic_result: Dict,
+    db: AsyncSession,
+    segments: Optional[List[str]] = None,
+    pre_computed_vec: Optional[List[float]] = None,
+) -> Dict:
+    """Основной ИИ-подбор, а если он ничего не дал — общая база по своим правилам.
+
+    Общая база проверяется последней: найденное в сегментах всегда
+    предпочтительнее, там цены и константы бренда.
+    """
+    res = await _match_one_ai_core(item, classic_result, db,
+                                   segments=segments,
+                                   pre_computed_vec=pre_computed_vec)
+    if res.get("status") != "not_found" or "gen" not in (segments or []):
+        return res
+    try:
+        gen = await _gen_relaxed_match(item, db, pre_computed_vec)
+    except Exception as exc:
+        logger.warning("gen fallback failed: %s", exc)
+        gen = None
+    if gen is None:
+        return res
+    logger.info("match_ai: GEN '%s' → %s (%s)",
+                (item.get("name_raw") or "")[:50],
+                gen["best_match"].get("article") or gen["best_match"].get("name", "")[:40],
+                gen["ai_reason"])
+    return gen
+
+
+async def _match_one_ai_core(
     item: Dict,
     classic_result: Dict,
     db: AsyncSession,

@@ -307,8 +307,9 @@ class DatabasePage(ctk.CTkFrame):
             font=FONT_SMALL, text_color=TEXT_SECONDARY,
         ).grid(row=0, column=0, padx=(12, 8), pady=8, sticky="w")
 
-        _vec_labels = [t("seg_ss"), t("seg_os"), t("seg_sil"), "Все сегменты"]
-        self._vec_seg_var = ctk.StringVar(value=_vec_labels[3])  # default: Все
+        _vec_labels = [t("seg_ss"), t("seg_os"), t("seg_sil"), t("seg_gen"),
+                       "Все сегменты"]
+        self._vec_seg_var = ctk.StringVar(value=_vec_labels[-1])  # default: Все
         self._vec_seg_btn = ctk.CTkSegmentedButton(
             self._vec_frame,
             values=_vec_labels,
@@ -325,7 +326,7 @@ class DatabasePage(ctk.CTkFrame):
         )
         self._vec_seg_btn.grid(row=0, column=1, padx=(0, 8), pady=6, sticky="ew")
         self._vec_seg_labels = _vec_labels
-        self._vec_seg_codes  = ["ss", "os", "sil", "all"]
+        self._vec_seg_codes  = ["ss", "os", "sil", "gen", "all"]
 
         self._vectorize_btn = ctk.CTkButton(
             self._vec_frame, text="🔄  Начать",

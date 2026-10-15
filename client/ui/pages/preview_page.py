@@ -389,8 +389,8 @@ class ArticleSearchDialog(ctk.CTkToplevel):
     выбрать сегмент базы и выполнить единый поиск по всем полям сразу.
     """
 
-    _SEG_LABELS = ["Слаботочные", "Освещение", "Силовые"]
-    _SEG_CODES  = ["ss", "os", "sil"]
+    _SEG_LABELS = ["Слаботочные", "Освещение", "Силовые", "Общая база"]
+    _SEG_CODES  = ["ss", "os", "sil", "gen"]
 
     def __init__(self, parent, api: ApiService, item: dict, default_segment: str = "ss"):
         super().__init__(parent)
@@ -399,7 +399,7 @@ class ArticleSearchDialog(ctk.CTkToplevel):
         self.selected = None
 
         self.title(t("search_dialog_title"))
-        self.geometry("900x620")
+        self.geometry("1000x620")
         self.grab_set()
         self.resizable(True, True)
         self.minsize(680, 460)
@@ -515,10 +515,14 @@ class ArticleSearchDialog(ctk.CTkToplevel):
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
-        cols = ["article", "name", "brand", "unit", "kaznisa_code", "rrts", "mrc"]
+        # «Цена АГСК» — единственная цена у позиций общей базы: РРЦ и МРЦ
+        # там пустые, и без этой колонки варианты не сравнить по цене
+        cols = ["article", "name", "brand", "unit", "kaznisa_code", "kaznisa",
+                "rrts", "mrc"]
         hdrs = [t("search_col_article"), t("search_col_name"),
-                t("search_col_brand"), "Ед.", "Код АГСК", "РРЦ", "МРЦ"]
-        widths = [150, 280, 90, 40, 120, 80, 80]
+                t("search_col_brand"), "Ед.", "Код АГСК", "Цена АГСК",
+                "РРЦ", "МРЦ"]
+        widths = [150, 280, 90, 40, 120, 90, 80, 80]
 
         style = ttk.Style()
         style.configure("Search.Treeview", rowheight=23, font=("Calibri", 10))
@@ -613,6 +617,7 @@ class ArticleSearchDialog(ctk.CTkToplevel):
                 p.get("brand", ""),
                 p.get("unit", "шт."),
                 p.get("kaznisa_code", "") or "—",
+                _fmt(p.get("kaznisa")),
                 _fmt(p.get("rrts")),
                 _fmt(p.get("mrc")),
             ))
@@ -2128,6 +2133,8 @@ class PreviewPage(ctk.CTkFrame):
             # Подбор по обозначению модели: латинско-цифровое обозначение
             # вроде «BVP431 LED134 NW 100W AMB» у светотехники
             "model":                    "method_model",
+            # ИИ подобрал в общей базе по смыслу + артикулу или параметрам
+            "ai_gen":                   "method_ai_gen",
             # Артикул с отброшенной кириллицей — путь для силовых баз
             "exact_nocyr":              "method_art_nocyr",
             "contains_nocyr":           "method_art_nocyr",

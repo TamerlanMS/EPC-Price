@@ -45,6 +45,7 @@ SEGMENT_WEEKDAY = {
     "ss":  0,   # Monday
     "os":  1,   # Tuesday
     "sil": 4,   # Friday
+    "gen": 2,   # Wednesday — общая база
 }
 
 
