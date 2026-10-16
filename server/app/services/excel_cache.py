@@ -298,6 +298,18 @@ def _extend_kp_table(wb: openpyxl.Workbook) -> None:
                             _copy(cell.alignment),
                         )
 
+    # ── 2b. Объединения подвала: снимаем, чтобы перенести вместе со значениями
+    # Иначе очистка старого места падает на MergedCell (значение можно менять
+    # только у первой ячейки объединения), а объединения остаются посреди
+    # расширенной таблицы.
+    footer_merges = []   # (min_col, min_row, max_col, max_row)
+    if footer_start:
+        footer_end = footer_start + FOOTER_ROWS - 1
+        for mr in list(kp.merged_cells.ranges):
+            if footer_start <= mr.min_row <= footer_end:
+                footer_merges.append((mr.min_col, mr.min_row, mr.max_col, mr.max_row))
+                kp.unmerge_cells(str(mr))
+
     # ── 3. Read source-row styles (last row inside the current table) ────────
     src_row    = current_end
     src_styles = {}   # col → (num_fmt, font, border, fill, alignment)
@@ -376,6 +388,13 @@ def _extend_kp_table(wb: openpyxl.Workbook) -> None:
                 except Exception:
                     pass
 
+        # Объединения — на новое место, с тем же сдвигом, что и значения.
+        # После записи: объединение оставляет значение только у первой ячейки,
+        # а оно уже на месте.
+        for c1, r1, c2, r2 in footer_merges:
+            kp.merge_cells(start_row=r1 + shift, start_column=c1,
+                           end_row=r2 + shift, end_column=c2)
+
     # ── 8. Update Таблица5.ref ────────────────────────────────────────────────
     kp_table.ref = _re.sub(
         r'(\$?[A-Za-z]+\$?)\d+$',
@@ -403,7 +422,18 @@ def _build_sync(products: List, brands: List,
                 template_bytes: Optional[bytes] = None) -> None:
     """CPU-bound: copy template, fill sheets, save. Runs in thread executor."""
     os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-    tmp = CACHE_PATH + ".tmp"
+    # Расширение .xlsm обязательно в конце: openpyxl определяет формат по нему
+    # и файл «base_template.xlsm.tmp» открыть отказывается — из-за этого кэш
+    # шаблона не пересобирался ни разу.
+    _root, _ext = os.path.splitext(CACHE_PATH)
+    tmp = f"{_root}.tmp{_ext}"
+    # Остаток прежних неудачных попыток со старым именем
+    _legacy_tmp = CACHE_PATH + ".tmp"
+    if os.path.exists(_legacy_tmp):
+        try:
+            os.remove(_legacy_tmp)
+        except OSError:
+            pass
     if template_bytes:
         with open(tmp, "wb") as f:
             f.write(template_bytes)
@@ -436,8 +466,40 @@ def _build_sync(products: List, brands: List,
                 CACHE_PATH, len(products), len(brands))
 
 
+# Фоновые пересборки: строго по одной и с явной ссылкой на задачу
+_rebuild_lock: Optional[asyncio.Lock] = None
+_bg_tasks: set = set()
+
+
+def schedule_base_template_rebuild() -> None:
+    """Запускает пересборку шаблона в фоне, не задерживая ответ.
+
+    Задача получает собственную сессию базы данных: сессия запроса будет
+    закрыта сразу после ответа, и пересборка не должна ею пользоваться.
+    """
+    task = asyncio.create_task(_rebuild_in_background())
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _rebuild_in_background() -> None:
+    global _rebuild_lock
+    if _rebuild_lock is None:
+        _rebuild_lock = asyncio.Lock()
+    # Две пересборки подряд (константы, затем база) писали бы в один
+    # промежуточный файл одновременно — пускаем их по очереди
+    async with _rebuild_lock:
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await rebuild_base_template(session)
+
+
 async def rebuild_base_template(db: AsyncSession) -> None:
-    """Fetch data from DB and rebuild cached base_template.xlsm in background."""
+    """Fetch data from DB and rebuild cached base_template.xlsm.
+
+    Сессию передаёт вызывающий и сам отвечает за её жизнь. Для фонового
+    запуска из эндпоинта — schedule_base_template_rebuild().
+    """
     try:
         products_res  = await db.execute(
             select(Product).where(Product.is_active == True).order_by(Product.num))

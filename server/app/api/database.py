@@ -21,7 +21,9 @@ from app.services.db_importer import (
     clear_segment_products, get_segment_stats,
 )
 from app.services.matcher import invalidate_product_cache
-from app.services.excel_cache import rebuild_base_template, CACHE_PATH, TEMPLATE_PATH
+from app.services.excel_cache import (
+    schedule_base_template_rebuild, CACHE_PATH, TEMPLATE_PATH,
+)
 from pydantic import BaseModel
 from typing import Optional, List
 import bcrypt
@@ -265,7 +267,7 @@ async def import_products(
     # Инвалидировать кэш товаров — следующий PDF-матчинг перечитает из БД
     invalidate_product_cache()
     # Rebuild cached base template in background (non-blocking)
-    asyncio.create_task(rebuild_base_template(db))
+    schedule_base_template_rebuild()   # своя сессия: сессия запроса закроется
     return {"status": "ok", "added": added, "updated": updated,
             "no_article": no_article}
 
@@ -295,7 +297,7 @@ async def import_constants(
                       details=f"brands_updated={count}",
                       ip=ip)
     # Rebuild cached base template in background (non-blocking)
-    asyncio.create_task(rebuild_base_template(db))
+    schedule_base_template_rebuild()   # своя сессия: сессия запроса закроется
     return {"status": "ok", "brands_updated": count}
 
 
@@ -461,7 +463,7 @@ async def clear_segment(
         changed_by=getattr(current_user, "username", ""),
     )
     invalidate_product_cache()
-    asyncio.create_task(rebuild_base_template(db))
+    schedule_base_template_rebuild()   # своя сессия: сессия запроса закроется
 
     action = "удалено" if hard else "деактивировано"
     logger.info("clear_segment[%s]: %d products %s by %s",
