@@ -22,7 +22,7 @@ from app.services.db_importer import (
 )
 from app.services.matcher import invalidate_product_cache
 from app.services.excel_cache import (
-    schedule_base_template_rebuild, CACHE_PATH, TEMPLATE_PATH,
+    schedule_base_template_rebuild, cache_is_servable, CACHE_PATH, TEMPLATE_PATH,
 )
 from pydantic import BaseModel
 from typing import Optional, List
@@ -418,6 +418,11 @@ async def get_base_template(
             404,
             "Кэшированный шаблон не найден. Выполните импорт товаров или констант."
         )
+    # Повреждённый шаблон не отдаём: клиент на 404 возьмёт свой локальный,
+    # а сервер тем временем соберёт новый
+    if not cache_is_servable():
+        schedule_base_template_rebuild()
+        raise HTTPException(404, "Шаблон пересобирается — используется локальный.")
     return FileResponse(
         CACHE_PATH,
         media_type="application/vnd.ms-excel.sheet.macroEnabled.12",

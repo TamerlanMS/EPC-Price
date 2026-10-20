@@ -131,7 +131,7 @@ def _sheet_found(wb, rows: List[Dict]):
             [20, 46, 46, 16, 14, 16, 16, 16, 16])
     for i, m in enumerate(rows, start=2):
         seg = m.get("segment", "")
-        _put(ws, i, 1, m.get("article", ""))
+        _put(ws, i, 1, (m.get("article") or (f"{m['article_src']} (не уникален)" if m.get("article_src") else "")))
         _put(ws, i, 2, m.get("name", ""))
         _put(ws, i, 3, m.get("db_name", ""))
         _put(ws, i, 4, SEGMENT_NAMES.get(seg, seg))
@@ -153,7 +153,7 @@ def _sheet_to_general(wb, rows: List[Dict], loaded: bool):
             ["Артикул", "Наименование", "Ед.", "Партнёр", "КазНИИСА"],
             [22, 62, 12, 18, 18])
     for i, e in enumerate(rows, start=2):
-        _put(ws, i, 1, e.get("article", ""))
+        _put(ws, i, 1, (e.get("article") or (f"{e['article_src']} (не уникален)" if e.get("article_src") else "")))
         _put(ws, i, 2, e.get("name", ""))
         _put(ws, i, 3, e.get("unit", ""))
         _put(ws, i, 4, e.get("partner"), MONEY)
@@ -165,7 +165,10 @@ def _sheet_to_general(wb, rows: List[Dict], loaded: bool):
                    if loaded else
                    "Режим сравнения: в базу ничего не загружалось.")).font = BOLD_FONT
     ws.cell(row=r + 1, column=1,
-            value="Позиции без артикула опознаются по наименованию.").font = BASE_FONT
+            value="Позиции без артикула опознаются по наименованию. Если одно "
+                  "значение «Артикула» стоит у разных товаров (марка кабеля, "
+                  "серия), оно помечено «не уникален» и товар тоже опознан "
+                  "по наименованию.").font = BASE_FONT
 
 
 def _sheet_summary(wb, stats: Dict, price_name: str, base_path: str,
@@ -188,7 +191,24 @@ def _sheet_summary(wb, stats: Dict, price_name: str, base_path: str,
 
     line("Дата сверки", datetime.now().strftime("%d.%m.%Y %H:%M"))
     line("Прайс", price_name)
-    line("Цены в прайсе", "уже с НДС" if vat_included else "без НДС, ×1.16")
+    _vh = stats.get("vat_from_header")
+    if _vh is True:
+        _vat_txt = "с НДС (указано в заголовке)"
+    elif _vh is False:
+        _vat_txt = "без НДС, ×1.16 (указано в заголовке)"
+    elif _vh == "mixed":
+        _vat_txt = "по-разному в колонках — по заголовкам"
+    else:
+        _vat_txt = ("уже с НДС (переключатель)" if vat_included
+                    else "без НДС, ×1.16 (переключатель)")
+    line("Цены в прайсе", _vat_txt)
+    if stats.get("layout_sheet"):
+        line("Лист прейскуранта", stats.get("layout_sheet"))
+        line("Строка шапки", stats.get("layout_header_row"))
+        if stats.get("layout_seb"):
+            line("Себестоимость ← колонка", stats.get("layout_seb"))
+        if stats.get("layout_kp"):
+            line("Цена КП ← колонка", stats.get("layout_kp"))
     line("Обновлять имеющиеся", "да" if update_existing else "нет", True)
     if update_existing and base_path:
         line("Файл базы", os.path.basename(base_path))
@@ -220,6 +240,16 @@ def _sheet_summary(wb, stats: Dict, price_name: str, base_path: str,
     r += 1
     line("Пропущено без цены", stats.get("skipped_no_price", 0))
     line("Дублей в прайсе", stats.get("duplicates", 0))
+    if stats.get("ambiguous_rows"):
+        line("Опознано по наименованию (артикул не уникален)",
+             stats.get("ambiguous_rows", 0))
+    if stats.get("skipped_total"):
+        line("Строк «Итого» / «Всего» пропущено", stats.get("skipped_total", 0))
+    _sus = stats.get("suspicious") or []
+    if _sus:
+        line("Оборванных наименований — поправьте в файле", len(_sus), True)
+        for x in _sus[:20]:
+            line(f"    стр. {x['row']}", x["name"])
     r += 1
     ws.cell(row=r, column=1,
             value="«Цена Себес» из прайса → колонка «Партнёр» (закупка), "

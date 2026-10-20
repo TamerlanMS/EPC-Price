@@ -1271,6 +1271,7 @@ class PreviewPage(ctk.CTkFrame):
                 projects=gen_projects,
                 output_path=path,
                 constants=self.constants,
+                manager_name=self._kp_manager_name(),
             )
 
             total_pos = sum(
@@ -3635,6 +3636,24 @@ class PreviewPage(ctk.CTkFrame):
         return messagebox.askyesno(t("pv_kp_price_diff"),
                                    msg, icon="warning")
 
+    def _kp_manager_name(self) -> str:
+        """Текущий пользователь как менеджер КП — если он есть в справочнике.
+
+        Имя возвращается в написании справочника: пользователь записан
+        «Григорий Пяк», справочник — «Пяк Григорий», а должность и контакты
+        в шапке КП находятся по имени из справочника.
+        """
+        cfg = getattr(self.app, "config", None)
+        me = (getattr(cfg, "user_full_name", "") or "").split()
+        key = sorted(w.lower() for w in me)
+        if not key:
+            return ""
+        for m in (self.constants or {}).get("managers_full") or []:
+            name = str(m.get("full_name") or "")
+            if sorted(w.lower() for w in name.split()) == key:
+                return name
+        return ""
+
     def _save(self):
         if not self.items:
             return
@@ -3709,8 +3728,19 @@ class PreviewPage(ctk.CTkFrame):
                 tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsm")
                 os.close(tmp_fd)
                 if self.api.download_base_template(tmp_path):
-                    base_tpl = tmp_path
-                    print("[Save] Using server base template")
+                    # Повреждённый шаблон в работу не берём — есть локальный
+                    import zipfile as _zf
+                    try:
+                        with _zf.ZipFile(tmp_path) as _z:
+                            _ok = _z.testzip() is None
+                    except Exception:
+                        _ok = False
+                    if _ok:
+                        base_tpl = tmp_path
+                        print("[Save] Using server base template")
+                    else:
+                        os.unlink(tmp_path)
+                        print("[Save] Server base template is corrupted, falling back")
                 else:
                     os.unlink(tmp_path)
                     print("[Save] Server base template not ready, falling back")
@@ -3725,18 +3755,38 @@ class PreviewPage(ctk.CTkFrame):
                     print(f"[Save] get_all_products: {e_db}")
 
             _excel_items = self._export_items()
-            try:
-                out = generate_excel(
+
+            def _generate(tpl_path, prods):
+                return generate_excel(
                     _excel_items, path,
                     constants=self.constants,
-                    products=products,
+                    products=prods,
                     brand_consts=self.brand_consts,
                     project_name="",
                     client_name="",
-                    manager_name="",
-                    base_template_path=base_tpl,
+                    manager_name=self._kp_manager_name(),
+                    base_template_path=tpl_path,
                     smr=self.smr_info(),
                 )
+
+            try:
+                try:
+                    out = _generate(base_tpl, products)
+                except Exception as e_gen:
+                    import zipfile as _zf
+                    _zip_err = (isinstance(e_gen, _zf.BadZipFile)
+                                or "magic number" in str(e_gen).lower()
+                                or "not a zip file" in str(e_gen).lower())
+                    if not (base_tpl and _zip_err):
+                        raise
+                    # Шаблон с сервера оказался битым — собираем по локальному
+                    print(f"[Save] server template failed ({e_gen}), using local")
+                    try:
+                        products = self.api.get_all_products()
+                    except Exception as e_db:
+                        print(f"[Save] get_all_products: {e_db}")
+                        products = []
+                    out = _generate("", products)
             finally:
                 if base_tpl and os.path.exists(base_tpl):
                     try: os.unlink(base_tpl)

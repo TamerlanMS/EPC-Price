@@ -116,6 +116,20 @@ def _strong_token(tok: str) -> bool:
     return len(tok) >= 3 and bool(re.search(r"[a-zа-яёх.]", tok))
 
 
+# Исполнение кабеля по пожарной безопасности: LS, LSLTx, FRLS, FRLSLTx, HF,
+# FRHF, LTx. Пишется слитно с маркой («ВВГнгFRLS») или через дефис
+# («ВВГнг(А)-LS»), поэтому граница — не латинская буква, а не \b.
+_CABLE_MARK_RE = re.compile(
+    r"(?<![a-z])((?:fr)?(?:ls|hf)(?:ltx)?|(?:fr)?ltx)(?![a-z])")
+
+
+def _cable_mark(text: str) -> str:
+    """Исполнение кабеля из текста или пустая строка."""
+    found = _CABLE_MARK_RE.findall(str(text or "").lower())
+    # Самое длинное: «frlsltx» точнее, чем случайно найденное «ls»
+    return max(found, key=len) if found else ""
+
+
 def _gen_corroborate(q_article: str, q_text: str,
                      c_article: str, c_name: str) -> tuple:
     """Подтверждён ли смысловой кандидат из общей базы. (да/нет, чем)."""
@@ -127,6 +141,13 @@ def _gen_corroborate(q_article: str, q_text: str,
         cn = article_key(c_name) or ""
         if len(qk) >= 6 and qk in cn:
             return True, "артикул в наименовании"
+
+    # Исполнение кабеля названо с обеих сторон — должно совпадать: на запрос
+    # огнестойкого FRLS нельзя отдавать обычный LS с тем же сечением
+    qm = _cable_mark(f"{q_article} {q_text}")
+    cm = _cable_mark(f"{c_article} {c_name}")
+    if qm and cm and qm != cm:
+        return False, ""
 
     qt = _key_tokens(f"{q_article} {q_text}")
     ct = _key_tokens(f"{c_article} {c_name}")

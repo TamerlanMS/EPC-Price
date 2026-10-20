@@ -417,6 +417,16 @@ def invalidate_base_template() -> None:
             logger.warning("excel_cache: could not delete cache: %s", e)
 
 
+def is_valid_xlsx(path: str) -> bool:
+    """Целый ли Excel-файл: ZIP читается и контрольные суммы сходятся."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            return z.testzip() is None and "xl/workbook.xml" in z.namelist()
+    except Exception:
+        return False
+
+
 def _build_sync(products: List, brands: List,
                 managers: List, currencies: List,
                 template_bytes: Optional[bytes] = None) -> None:
@@ -425,8 +435,24 @@ def _build_sync(products: List, brands: List,
     # Расширение .xlsm обязательно в конце: openpyxl определяет формат по нему
     # и файл «base_template.xlsm.tmp» открыть отказывается — из-за этого кэш
     # шаблона не пересобирался ни разу.
+    # У каждой сборки свой промежуточный файл: сервер работает в нескольких
+    # процессах, и общий файл две одновременные сборки перемешивали
+    import tempfile, glob
     _root, _ext = os.path.splitext(CACHE_PATH)
-    tmp = f"{_root}.tmp{_ext}"
+    # Остатки сборок, упавших посередине. Только старые: сборка идёт
+    # меньше минуты, а свежий файл может принадлежать сборке, которая
+    # прямо сейчас работает в другом процессе
+    import time as _time
+    for _old in glob.glob(f"{_root}.*.tmp{_ext}"):
+        try:
+            if _time.time() - os.path.getmtime(_old) > 30 * 60:
+                os.remove(_old)
+        except OSError:
+            pass
+    _fd, tmp = tempfile.mkstemp(prefix=os.path.basename(_root) + ".",
+                                suffix=".tmp" + _ext,
+                                dir=os.path.dirname(CACHE_PATH))
+    os.close(_fd)
     # Остаток прежних неудачных попыток со старым именем
     _legacy_tmp = CACHE_PATH + ".tmp"
     if os.path.exists(_legacy_tmp):
@@ -461,6 +487,14 @@ def _build_sync(products: List, brands: List,
 
     wb.save(tmp)
     _inject_x14_dv(tmp)   # восстанавливаем x14:DV в WV 4.0
+    # Повреждённый файл шаблоном не становится: прежний остаётся на месте
+    if not is_valid_xlsx(tmp):
+        logger.error("excel_cache: собранный шаблон повреждён — замена отменена")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return
     os.replace(tmp, CACHE_PATH)   # atomic replace
     logger.info("excel_cache: rebuilt %s (%d products, %d brands)",
                 CACHE_PATH, len(products), len(brands))
@@ -489,9 +523,62 @@ async def _rebuild_in_background() -> None:
     # Две пересборки подряд (константы, затем база) писали бы в один
     # промежуточный файл одновременно — пускаем их по очереди
     async with _rebuild_lock:
-        from app.core.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as session:
-            await rebuild_base_template(session)
+        # Очередь внутри процесса не видит другой процесс сервера —
+        # блокируем ещё и файлом, на всю пересборку от чтения базы до замены
+        lock_fh = await asyncio.to_thread(_acquire_process_lock)
+        try:
+            from app.core.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                await rebuild_base_template(session)
+        finally:
+            _release_process_lock(lock_fh)
+
+
+def _acquire_process_lock():
+    """Межпроцессная блокировка пересборки. Ждёт, пока другая не закончит."""
+    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+    fh = open(os.path.join(os.path.dirname(CACHE_PATH), ".base_template.lock"), "a+")
+    try:
+        import fcntl
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except ImportError:          # Windows при локальной разработке
+        pass
+    return fh
+
+
+def _release_process_lock(fh) -> None:
+    try:
+        import fcntl
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except ImportError:
+        pass
+    finally:
+        fh.close()
+
+
+# Результат проверки шаблона при отдаче: (время изменения, размер) → цел ли.
+# Проверять один и тот же файл при каждом сохранении КП незачем.
+_served_check: Dict[str, object] = {"stamp": None, "ok": False}
+
+
+def cache_is_servable() -> bool:
+    """Можно ли отдавать шаблон клиенту. Повреждённый — удаляется."""
+    try:
+        st = os.stat(CACHE_PATH)
+    except OSError:
+        return False
+    stamp = (st.st_mtime_ns, st.st_size)
+    if _served_check["stamp"] != stamp:
+        _served_check["stamp"], _served_check["ok"] = stamp, is_valid_xlsx(CACHE_PATH)
+    if not _served_check["ok"]:
+        logger.error("excel_cache: шаблон повреждён — удалён, будет пересобран")
+        try:
+            os.remove(CACHE_PATH)
+        except OSError:
+            pass
+        _served_check["stamp"] = None
+        return False
+    return True
 
 
 async def rebuild_base_template(db: AsyncSession) -> None:

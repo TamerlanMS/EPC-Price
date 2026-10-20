@@ -927,7 +927,12 @@ class DatabasePage(ctk.CTkFrame):
                 # Причина есть — значит файл не удалось прочитать, и беда не
                 # в его формате. Показываем именно её: «формат не распознан»
                 # отправляет искать ошибку не там.
-                if _why:
+                if _why and _why.startswith("Это похоже на КП"):
+                    messagebox.showwarning(
+                        "Это не прейскурант",
+                        f"{_why}\n\nФайл: {os.path.basename(path)}",
+                        parent=self)
+                elif _why:
                     messagebox.showerror(
                         "Не удалось прочитать файл",
                         f"{_why}\n\nФайл: {os.path.basename(path)}",
@@ -1159,6 +1164,15 @@ class DatabasePage(ctk.CTkFrame):
                     "dealer_rows":      len(rows),
                     "skipped_no_price": parsed["skipped_no_price"],
                     "duplicates":       parsed["duplicates"],
+                    "ambiguous_rows":   parsed.get("ambiguous_rows", 0),
+                    # Как прейскурант понят — показываем менеджеру
+                    "layout_sheet":     parsed.get("sheet", ""),
+                    "layout_header_row": parsed.get("header_row"),
+                    "layout_seb":       (parsed.get("titles") or {}).get("seb", ""),
+                    "layout_kp":        (parsed.get("titles") or {}).get("kp", ""),
+                    "vat_from_header":  parsed.get("vat_from_header"),
+                    "skipped_total":    parsed.get("skipped_total", 0),
+                    "suspicious":       parsed.get("suspicious") or [],
                 }
 
                 # ── Цены в приложенном файле ────────────────────────────
@@ -1192,6 +1206,12 @@ class DatabasePage(ctk.CTkFrame):
                 stats["by_segment"]  = db["stats"]["by_segment"]
                 stats["new"]         = db["stats"]["new"]
                 stats["added"] = stats["updated"] = 0
+
+                # Позициям, опознанным по наименованию, возвращаем исходное
+                # значение колонки «Артикул» — для отчёта
+                _src = {d["key"]: d.get("article_src", "") for d in rows}
+                for _e in list(db["matched"]) + list(db["new"]):
+                    _e["article_src"] = _src.get(_e.get("key"), "")
 
                 result = {"stats": stats, "changed": changed,
                           "found": db["matched"], "new": db["new"],
@@ -1229,6 +1249,32 @@ class DatabasePage(ctk.CTkFrame):
         if st.get("duplicates") or st.get("skipped_no_price"):
             head += (f"\nПропущено: без цены {st.get('skipped_no_price', 0):,}, "
                      f"дублей в прайсе {st.get('duplicates', 0):,}")
+        if st.get("ambiguous_rows"):
+            head += (f"\nОпознано по наименованию {st['ambiguous_rows']:,} поз.: "
+                     f"в колонке «Артикул» одно значение у разных товаров "
+                     f"(марка или серия, а не артикул)")
+
+        # Как понят файл: лист, шапка, колонки цен, источник НДС
+        if st.get("layout_sheet"):
+            _vat = {True: "с НДС — указано в заголовке",
+                    False: "без НДС — указано в заголовке, × 1.16",
+                    "mixed": "по-разному в колонках — по заголовкам"
+                    }.get(st.get("vat_from_header"),
+                          "в заголовке не указан — по переключателю")
+            _cols = []
+            if st.get("layout_seb"):
+                _cols.append(f"Себес ← «{st['layout_seb']}»")
+            if st.get("layout_kp"):
+                _cols.append(f"КП ← «{st['layout_kp']}»")
+            head += (f"\nЛист «{st['layout_sheet']}», шапка в строке "
+                     f"{st.get('layout_header_row')}   |   {'   ·   '.join(_cols)}"
+                     f"   |   НДС: {_vat}")
+        _sus = st.get("suspicious") or []
+        if _sus:
+            _ex = ", ".join(f"стр. {x['row']} «{x['name']}»" for x in _sus[:3])
+            head += (f"\n⚠  Оборванное наименование у {len(_sus):,} поз.: {_ex}"
+                     + (" …" if len(_sus) > 3 else "")
+                     + " — поправьте в файле, иначе ИИ их не найдёт")
 
         self._pl_summary.configure(text=head, text_color=NAVY)
 

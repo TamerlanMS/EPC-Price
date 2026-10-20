@@ -21,7 +21,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import require_admin_up, get_current_user
 from app.models.models import ExcelTemplate, User
-from app.services.excel_cache import invalidate_base_template
+from app.services.excel_cache import (
+    invalidate_base_template, schedule_base_template_rebuild,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -112,8 +114,11 @@ async def upload_template(
     await db.commit()
     await db.refresh(tpl)
 
-    # Сбрасываем кэш base_template — следующий запрос пересоберёт с новым шаблоном
+    # Сбрасываем кэш и сразу собираем заново. Сам по себе запрос шаблона
+    # пустой кэш не пересобирает — без этого новый шаблон не применялся бы
+    # до ближайшего импорта базы
     invalidate_base_template()
+    schedule_base_template_rebuild()
     logger.info(
         "excel_template: uploaded v%d '%s' by user_id=%d, size=%d bytes",
         new_version, file.filename, current_user.id, len(data),
@@ -200,4 +205,5 @@ async def delete_template(
     )
     await db.commit()
     invalidate_base_template()
+    schedule_base_template_rebuild()
     logger.info("excel_template: all DB templates deactivated — fallback to filesystem")

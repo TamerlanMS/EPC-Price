@@ -28,6 +28,7 @@
 """
 import math
 import os
+import re
 import sys
 import shutil
 import openpyxl
@@ -356,8 +357,9 @@ def _fill_kp_header(wb: openpyxl.Workbook, manager: str, project: str, client: s
         return
     kp = wb["КП"]
     try:
-        if manager:
-            kp["C3"] = manager
+        # Менеджер не задан — очищаем: в шаблоне может остаться имя из
+        # рабочего файла, и его контакты попали бы в чужое КП
+        kp["C3"] = manager or None
         if project:
             kp["F3"] = project
         if client:
@@ -1440,6 +1442,204 @@ def _clean_xlsx_output(path: str) -> None:
     except Exception as exc:
         print(f"[clean] failed: {exc}")
 
+# ─── Колонка L листа WV 4.0 ──────────────────────────────────────────────────
+#
+# В старом шаблоне — «Код КазНИИСА», в новом (WV 0004) — «Сумма КазНИИСА».
+# Смысл колонки берём из заголовка шаблона, как это делает макрос
+# РАССЧИТАТЬ_ДАННЫЕ: он тоже выбирает расчёт по тексту заголовка.
+
+_WV_L_TITLES = {"sum": "Сумма КазНИИСА", "price": "Цена КазНИИСА", "code": "Код АГСК"}
+
+
+def _wv_l_mode(header) -> str:
+    """Что писать в колонку L: «sum», «price» или «code»."""
+    h = str(header or "").lower()
+    if "казнииса" in h or "казниса" in h:
+        if "сумм" in h:
+            return "sum"
+        if "цен" in h:
+            return "price"
+    return "code"
+
+
+def _wv_l_value(mode: str, bm: Dict, item: Dict, qty) -> Optional[object]:
+    """Значение колонки L для позиции."""
+    if mode == "code":
+        return (bm.get("kaznisa_code") or item.get("kaznisa_code_raw") or "") or None
+    try:
+        kaz = float(bm.get("kaznisa") or 0)
+    except (TypeError, ValueError):
+        kaz = 0.0
+    if not kaz:
+        return None
+    if mode == "price":
+        return round(kaz, 2)
+    try:
+        q = float(qty or 1)
+    except (TypeError, ValueError):
+        q = 1.0
+    return round(kaz * q, 2)
+
+
+# ─── Свод (лист «АвтоСВОД») ──────────────────────────────────────────────────
+
+SVOD_SHEET = "АвтоСВОД"
+_SVOD_COLS = 14          # A:N — как в макросе SyncDataValuesAndColors
+
+
+def _last_used_row(ws, ncols: int) -> int:
+    for r in range(ws.max_row, 1, -1):
+        for c in range(1, ncols + 1):
+            v = ws.cell(row=r, column=c).value
+            if v not in (None, ""):
+                return r
+    return 1
+
+
+def _svod_brands_and_margins(item_lists, brand_consts_list):
+    """Бренды позиций и их маржа. Бренды — из самих позиций, а не из
+    колонки A: там у аналогов «↳ ИМЯ», а в «Сохранить всех» — заголовки."""
+    brands = {}
+    for items in item_lists:
+        for it in items or []:
+            if it.get("is_heading") or it.get("status") == "heading":
+                continue
+            b = str((it.get("best_match") or {}).get("brand") or "").strip()
+            if b:
+                brands.setdefault(b.upper(), b)
+    margins = {}
+    for bc in brand_consts_list:
+        for k, v in (bc or {}).items():
+            try:
+                if v and v.get("margin") is not None:
+                    margins.setdefault(str(k).upper(), float(v["margin"]))
+            except (TypeError, ValueError, AttributeError):
+                pass
+    for items in item_lists:
+        for it in items or []:
+            b = str((it.get("best_match") or {}).get("brand") or "").strip().upper()
+            bc = it.get("_brand_consts") or {}
+            if b and b not in margins and bc.get("margin") is not None:
+                try:
+                    margins[b] = float(bc["margin"])
+                except (TypeError, ValueError):
+                    pass
+    names = sorted(brands.values(), key=lambda x: x.casefold())
+    return names, margins
+
+
+def _fill_auto_svod(wb, sources, brand_names, margins) -> None:
+    """Собирает «АвтоСВОД», как макрос SyncDataValuesAndColors.
+
+    sources — листы WV по порядку; шапка берётся из первого. Копируются
+    значения и форматы A:N и ширина колонок; формулы не переносятся —
+    у макроса это «вставить значения».
+    """
+    from copy import copy as _copy
+    from openpyxl.cell.cell import MergedCell
+    if SVOD_SHEET not in wb.sheetnames or not sources:
+        return
+    sv = wb[SVOD_SHEET]
+    for mr in list(sv.merged_cells.ranges):
+        sv.unmerge_cells(str(mr))
+    if sv.max_row:
+        sv.delete_rows(1, sv.max_row)
+
+    out_r = 0
+    for si, src in enumerate(sources):
+        last = _last_used_row(src, _SVOD_COLS)
+        first = 1 if si == 0 else 2          # шапку берём один раз
+        offset = out_r - (first - 1)
+        for r in range(first, last + 1):
+            out_r += 1
+            for c in range(1, _SVOD_COLS + 1):
+                sc = src.cell(row=r, column=c)
+                dc = sv.cell(row=out_r, column=c)
+                if not isinstance(sc, MergedCell):
+                    v = sc.value
+                    if isinstance(v, str) and v.startswith("="):
+                        v = None              # «вставить значения»: формул нет
+                    dc.value = v
+                if sc.has_style:
+                    dc._style = _copy(sc._style)
+            if src.row_dimensions[r].height:
+                sv.row_dimensions[out_r].height = src.row_dimensions[r].height
+        # Объединения строк данных (заголовки разделов) — со сдвигом
+        for mr in list(src.merged_cells.ranges):
+            if mr.min_row >= first and mr.max_row <= last and mr.max_col <= _SVOD_COLS:
+                sv.merge_cells(start_row=mr.min_row + offset, start_column=mr.min_col,
+                               end_row=mr.max_row + offset, end_column=mr.max_col)
+
+    first_src = sources[0]
+    for c in range(1, _SVOD_COLS + 1):
+        letter = get_column_letter(c)
+        w = first_src.column_dimensions[letter].width
+        if w:
+            sv.column_dimensions[letter].width = w
+
+    # O — бренды по алфавиту, P — маржа бренда (у макроса: Const, колонка I)
+    head = sv.cell(row=1, column=16, value="Данные из Const (I)")
+    head.font = Font(bold=True)
+    for i, b in enumerate(brand_names, start=2):
+        sv.cell(row=i, column=15, value=b)
+        m = margins.get(b.upper())
+        if m is not None:
+            sv.cell(row=i, column=16, value=m)
+    o_w = max([len(b) for b in brand_names] + [6]) + 2
+    sv.column_dimensions["O"].width = min(o_w, 40)
+    sv.column_dimensions["P"].width = len("Данные из Const (I)") + 2
+
+
+# ─── Формулы на удалённые листы ──────────────────────────────────────────────
+
+# Поиск менеджера в шапке КП: VLOOKUP($C$3, Const!B:E, N, 0)
+_MGR_LOOKUP_RE = re.compile(r"VLOOKUP\(\s*\$?C\$?3\s*,\s*Const!\$?B:\$?E\s*,\s*(\d)", re.I)
+_MGR_FIELD_BY_COL = {2: "position", 3: "email", 4: "phone"}   # Const: B ФИО, C, D, E
+_EXT_REF_RE = re.compile(r"\[\d+\]")
+_SHEET_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-zА-Яа-яЁё0-9_]+))!")
+
+
+def _resolve_dead_refs(wb, constants: Optional[Dict] = None) -> int:
+    """Формулы, которые в готовом КП не посчитаются, — в значения или пусто.
+
+    Готовый КП — .xlsx без БД, Const и макросов. Формула, которая ссылается
+    на удалённый лист, внешнюю книгу или макрос РАССЧИТАТЬ_ДАННЫЕ, покажет
+    #ССЫЛКА! или #ИМЯ?. Шапку менеджера подставляем из справочника.
+    Возвращает число исправленных ячеек.
+    """
+    from openpyxl.cell.cell import MergedCell
+    from openpyxl.worksheet.formula import ArrayFormula
+    alive = {n.lower() for n in wb.sheetnames}
+    managers = {}
+    for m in (constants or {}).get("managers_full") or []:
+        name = str(m.get("full_name") or "").strip().lower()
+        if name:
+            managers[name] = m
+    fixed = 0
+    for ws in wb.worksheets:
+        mgr = managers.get(str(ws["C3"].value or "").strip().lower())
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell, MergedCell):
+                    continue
+                v = cell.value
+                t = v.text if isinstance(v, ArrayFormula) else v
+                if not (isinstance(t, str) and t.startswith("=")):
+                    continue
+                dead = ("РАССЧИТАТЬ_ДАННЫЕ" in t.upper() or _EXT_REF_RE.search(t)
+                        or any((a or b).lower() not in alive
+                               for a, b in _SHEET_REF_RE.findall(t)))
+                if not dead:
+                    continue
+                m = _MGR_LOOKUP_RE.search(t)
+                if m and mgr:
+                    cell.value = mgr.get(_MGR_FIELD_BY_COL.get(int(m.group(1)), "")) or None
+                else:
+                    cell.value = None
+                fixed += 1
+    return fixed
+
+
 def generate_excel(
     items: List[Dict],
     output_path: str,
@@ -1491,7 +1691,7 @@ def generate_excel(
 
     # Удаляем все листы кроме WV 4.0 и КП (убираем БД/Const/лишние)
     for _sn in list(wb.sheetnames):
-        if _sn not in ("WV 4.0", "КП"):
+        if _sn not in ("WV 4.0", "КП", SVOD_SHEET):
             del wb[_sn]
 
     if "WV 4.0" not in wb.sheetnames:
@@ -1504,11 +1704,12 @@ def generate_excel(
         _h_g = ws.cell(row=1, column=WV_CONST_PRC)
         if (_h_g.value or "").strip() in ("Константа цена", "Константа цены"):
             _h_g.value = "Предварительная цена"
-        _h_l = ws.cell(row=1, column=WV_KAZNIISA)
-        if "КазНИИСА" in (_h_l.value or ""):
-            _h_l.value = "Код АГСК"
     except Exception:
         pass
+    # Колонка L: в старом шаблоне — код (заголовок «Код АГСК»), в новом —
+    # «Сумма КазНИИСА». Смысл — по заголовку шаблона.
+    _l_mode = _wv_l_mode(ws.cell(row=1, column=WV_KAZNIISA).value)
+    ws.cell(row=1, column=WV_KAZNIISA).value = _WV_L_TITLES[_l_mode]
 
     # Расширяем стили листов под фактическое количество позиций
     _extend_sheet_styles(ws, len(items), data_start=2)
@@ -1521,12 +1722,17 @@ def generate_excel(
     # article/price data and would corrupt row numbering and formula ranges.
     excel_items = items  # headings included — written as section dividers
 
-    _clear_input_rows(ws, start_row=2, end_row=max(465, 2 + len(excel_items)))
-    # Очищаем формульные и именные колонки WV 4.0 чтобы не было #REF! без листа БД
-    _wv_clear_end = max(466, 2 + len(excel_items))
+    # Строки данных очищаем целиком: в новом шаблоне формулы по БД и Const
+    # стоят во всех строках и всех расчётных колонках, а эти листы в готовом
+    # КП удаляются. Стили строк остаются.
+    from openpyxl.cell.cell import MergedCell as _MergedCell
+    _wv_clear_end = max(466, ws.max_row, 2 + len(excel_items))
+    _wv_clear_cols = max(16, ws.max_column)
     for _r in range(2, _wv_clear_end + 1):
-        for _c in (3, 4, 6, 8, 9, 10, 11):   # C,D,F,H,I,J,K
-            ws.cell(row=_r, column=_c).value = None
+        for _c in range(1, _wv_clear_cols + 1):
+            _cell = ws.cell(row=_r, column=_c)
+            if not isinstance(_cell, _MergedCell) and _cell.value is not None:
+                _cell.value = None
 
     for i, item in enumerate(excel_items):
         row = 2 + i
@@ -1537,7 +1743,8 @@ def generate_excel(
             h_kaz     = item.get("kaznisa_code_raw", "") or ""
             ws.cell(row=row, column=WV_NAME,     value=h_name    or None)
             ws.cell(row=row, column=WV_ARTICLE,  value=h_article or None)
-            ws.cell(row=row, column=WV_KAZNIISA, value=h_kaz     or None)
+            if _l_mode == "code":
+                ws.cell(row=row, column=WV_KAZNIISA, value=h_kaz or None)
             _apply_heading_style(ws, row)
             continue
 
@@ -1595,9 +1802,11 @@ def generate_excel(
                 if _val:
                     _c = ws.cell(row=row, column=_col, value=round(_val, 2))
                     _c.number_format = "#,##0.00"
-            _a_kaz = bm_a.get("kaznisa_code") or item.get("kaznisa_code_raw") or ""
-            if _a_kaz:
-                ws.cell(row=row, column=WV_KAZNIISA, value=_a_kaz)
+            _a_l = _wv_l_value(_l_mode, bm_a, item, qty_a)
+            if _a_l not in (None, ""):
+                _alc = ws.cell(row=row, column=WV_KAZNIISA, value=_a_l)
+                if _l_mode != "code":
+                    _alc.number_format = "#,##0.00"
             for col in range(1, 15):
                 ws.cell(row=row, column=col).fill = _ANALOG_FILL
                 ws.cell(row=row, column=col).font = _ANALOG_FONT
@@ -1705,9 +1914,11 @@ def generate_excel(
                 _c = ws.cell(row=row, column=_col, value=round(_val, 2))
                 _c.number_format = "#,##0.00"
 
-        _kaz = bm.get("kaznisa_code") or item.get("kaznisa_code_raw") or ""
-        if _kaz:
-            ws.cell(row=row, column=WV_KAZNIISA, value=_kaz)
+        _l_val = _wv_l_value(_l_mode, bm, item, qty)
+        if _l_val not in (None, ""):
+            _lc = ws.cell(row=row, column=WV_KAZNIISA, value=_l_val)
+            if _l_mode != "code":
+                _lc.number_format = "#,##0.00"
 
         comment  = item.get("comment")  or ""
         delivery = item.get("delivery") or ""
@@ -1747,6 +1958,19 @@ def generate_excel(
     except Exception as e:
         print(f"[Excel/КП data] {e}")
 
+    # 4б. Свод — как макрос SyncDataValuesAndColors в шаблоне
+    try:
+        _brands, _margins = _svod_brands_and_margins([items], [brand_consts or {}])
+        _fill_auto_svod(wb, [ws], _brands, _margins)
+    except Exception as e:
+        print(f"[Excel/АвтоСВОД] {e}")
+
+    # 4в. Формулы на удалённые листы, внешние книги и макросы
+    try:
+        _resolve_dead_refs(wb, constants)
+    except Exception as e:
+        print(f"[Excel/формулы] {e}")
+
     # 5. Сохраняем файл
     wb.save(out_path)
     _clean_xlsx_output(out_path)   # убираем слайсеры, #REF! CF, calc formulas
@@ -1758,6 +1982,7 @@ def generate_excel_multi(
     constants: Optional[Dict] = None,
     products: Optional[List[Dict]] = None,
     base_template_path: str = "",
+    manager_name: str = "",
 ) -> str:
     """
     Build an .xlsm starting from an exact template copy:
@@ -1801,6 +2026,11 @@ def generate_excel_multi(
         )
         wv_first.title = sname0
 
+    # Смысл колонки L — по заголовку шаблона, одинаково на всех листах
+    _l_mode_m = _wv_l_mode(wv_first.cell(row=1, column=12).value)
+    wv_first.cell(row=1, column=12).value = _WV_L_TITLES[_l_mode_m]
+    _wv_sheets = [wv_first]
+
     if wv_first.max_row and wv_first.max_row > 1:
         wv_first.delete_rows(2, wv_first.max_row - 1)
 
@@ -1823,7 +2053,7 @@ def generate_excel_multi(
         "Кратность", "Предварительная цена",
         "Цена себес", "Сумма себес",
         "Цена КП", "Сумма КП",
-        "Код АГСК",
+        _WV_L_TITLES[_l_mode_m],
         "Комментарии", "Срок поставки",
     ]
     WV_ALNS   = [
@@ -1875,7 +2105,7 @@ def generate_excel_multi(
                     None,
                     seb_price_a, seb_sum_a,
                     kp_price_a, kp_sum_a,
-                    bm_a.get("kaznisa_code") or "",
+                    _wv_l_value(_l_mode_m, bm_a, item, qty_a) or "",
                     "↳ аналог", "",
                 ]
                 for ci2, (val, aln) in enumerate(zip(row_vals_a, WV_ALNS), 1):
@@ -1900,7 +2130,8 @@ def generate_excel_multi(
                     bm_o.get("unit")    or item.get("unit")        or "",
                     qty_o,
                     None, None, None, None, None, None,
-                    bm_o.get("kaznisa_code") or item.get("kaznisa_code_raw") or "",
+                    (_wv_l_value("code", bm_o, item, qty_o) or "")
+                    if _l_mode_m == "code" else None,
                     "→ заменён аналогом", "",
                 ]
                 _orig_font_m = Font(name="Calibri", size=10, italic=True, strike=True, color="808080")
@@ -1936,7 +2167,7 @@ def generate_excel_multi(
                 item.get("_user_const_price") or None,
                 seb_price, seb_sum,
                 kp_price,  kp_sum,
-                bm.get("kaznisa_code") or item.get("kaznisa_code_raw") or "",
+                _wv_l_value(_l_mode_m, bm, item, qty) or "",
                 item.get("comment")  or "",
                 item.get("delivery") or "",
             ]
@@ -1969,6 +2200,7 @@ def generate_excel_multi(
         ws.row_dimensions[1].height = wv_hdr_height
         ws.freeze_panes = "A2"
         _write_wv_data(ws, proj.get("items", []))
+        _wv_sheets.append(ws)
 
     kp_ws = wb["КП"]
     # Clear old template formulas from the data range before writing.
@@ -2116,6 +2348,32 @@ def generate_excel_multi(
                 if ci2 in KP_PRICE_COL:
                     c.number_format = NUM_FMT
             kp_row += 1
+
+    # Шапка КП: менеджер (или пусто — без чужого имени из шаблона)
+    try:
+        _fill_kp_header(wb, manager=manager_name, project="", client="")
+    except Exception as e:
+        print(f"[Excel/КП header multi] {e}")
+
+    # Служебные листы шаблона (БД, Const и прочие) в готовый КП не идут:
+    # в новом шаблоне они есть, и без этого в файл уезжала вся база
+    _keep = {"КП", SVOD_SHEET} | {w.title for w in _wv_sheets}
+    for _sn in list(wb.sheetnames):
+        if _sn not in _keep:
+            del wb[_sn]
+
+    # Свод по всем проектам — и формулы на удалённые листы
+    try:
+        _brands, _margins = _svod_brands_and_margins(
+            [pr.get("items") for pr in projects],
+            [pr.get("brand_consts") for pr in projects])
+        _fill_auto_svod(wb, _wv_sheets, _brands, _margins)
+    except Exception as e:
+        print(f"[Excel/АвтоСВОД multi] {e}")
+    try:
+        _resolve_dead_refs(wb, constants)
+    except Exception as e:
+        print(f"[Excel/формулы multi] {e}")
 
     wb.save(out_path)
     _clean_xlsx_output(out_path)   # убираем макросы, слайсеры, битые имена
