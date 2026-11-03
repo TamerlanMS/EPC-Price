@@ -75,6 +75,23 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE import_logs ADD COLUMN IF NOT EXISTS changed_by VARCHAR(150)"
             ))
+            # Ведение базы из интерфейса: кто менял и корзина
+            await conn.execute(text(
+                "ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_by VARCHAR(150)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE products ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE products ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(150)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_products_deleted_at ON products (deleted_at)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_products_segment_active "
+                "ON products (segment, is_active)"
+            ))
         logger.info("Schema migrations applied")
     except Exception as exc:
         logger.error("Schema migration failed: %s", exc)

@@ -505,12 +505,23 @@ _rebuild_lock: Optional[asyncio.Lock] = None
 _bg_tasks: set = set()
 
 
+# Сколько пересборок ждут очереди. Одной ожидающей достаточно: она
+# прочтёт базу, когда начнётся, и увидит все изменения, сделанные до неё.
+# Без этого правка ячеек подряд выстраивала бы очередь из десятков сборок.
+_waiting_rebuilds = 0
+
+
 def schedule_base_template_rebuild() -> None:
     """Запускает пересборку шаблона в фоне, не задерживая ответ.
 
     Задача получает собственную сессию базы данных: сессия запроса будет
     закрыта сразу после ответа, и пересборка не должна ею пользоваться.
+    Если одна пересборка уже ждёт очереди, вторая не ставится.
     """
+    global _waiting_rebuilds
+    if _waiting_rebuilds > 0:
+        return
+    _waiting_rebuilds += 1
     task = asyncio.create_task(_rebuild_in_background())
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
@@ -522,7 +533,11 @@ async def _rebuild_in_background() -> None:
         _rebuild_lock = asyncio.Lock()
     # Две пересборки подряд (константы, затем база) писали бы в один
     # промежуточный файл одновременно — пускаем их по очереди
+    global _waiting_rebuilds
     async with _rebuild_lock:
+        # Начали: следующая правка должна поставить ещё одну сборку,
+        # потому что эта базу уже читает
+        _waiting_rebuilds = max(0, _waiting_rebuilds - 1)
         # Очередь внутри процесса не видит другой процесс сервера —
         # блокируем ещё и файлом, на всю пересборку от чтения базы до замены
         lock_fh = await asyncio.to_thread(_acquire_process_lock)

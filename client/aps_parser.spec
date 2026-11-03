@@ -31,6 +31,7 @@ a = Analysis(
         "services.excel_generator",
         "services.dealer_price",
         "services.dealer_price_report",
+        "services.product_fields",
         "xlrd",
 
         "assets",
@@ -49,6 +50,9 @@ a = Analysis(
         "ui.pages.upload_page",
         "ui.pages.preview_page",
         "ui.pages.database_page",
+        "ui.pages.grid_cell_editor",
+        "ui.pages.products_tab",
+        "ui.pages.product_entry_tab",
 
         # tkinter
         "tkinter",
@@ -102,7 +106,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="EPC Price 8.6.1",
+    name="EPC Price 8.6.2",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

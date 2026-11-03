@@ -14,7 +14,7 @@ from app.core.audit import write_audit
 from app.core.config import settings
 from app.models.models import (
     Product, BrandConstant, CurrencyRate, ImportLog, Manager,
-    AppSetting, DEFAULT_APP_SETTINGS, SMR_KINDS,
+    AppSetting, DEFAULT_APP_SETTINGS, SMR_KINDS, KNOWN_SEGMENTS,
 )
 from app.services.db_importer import (
     import_products_from_excel, import_constants_from_excel,
@@ -36,16 +36,29 @@ router = APIRouter()
 # ─── Schemas ───────────────────────────────────────────────────────────────────
 
 class ProductUpdate(BaseModel):
-    article:  Optional[str]   = None
-    name:     Optional[str]   = None
-    unit:     Optional[str]   = None
-    kaznisa:  Optional[float] = None
-    rrts:     Optional[float] = None
-    mrc:      Optional[float] = None
-    opt:      Optional[float] = None
-    partner:  Optional[float] = None
-    brand:    Optional[str]   = None
-    is_active: Optional[bool] = None
+    """Правка позиции. Переданное поле со значением null — очистить."""
+    num:          Optional[int]   = None
+    article:      Optional[str]   = None
+    name:         Optional[str]   = None
+    unit:         Optional[str]   = None
+    kaznisa:      Optional[float] = None
+    rrts:         Optional[float] = None
+    mrc:          Optional[float] = None
+    opt:          Optional[float] = None
+    partner:      Optional[float] = None
+    brand:        Optional[str]   = None
+    multiplicity: Optional[int]   = None
+    kaznisa_code: Optional[str]   = None
+
+
+class ProductIds(BaseModel):
+    ids: List[int]
+
+
+class ProductUpsert(BaseModel):
+    segment: str
+    rows:    List[dict]
+    dry_run: bool = False
 
 
 class ConstantUpdate(BaseModel):
@@ -157,40 +170,297 @@ async def list_all_products(
     ]
 
 
+_PRODUCT_SORTABLE = {
+    "num", "article", "name", "unit", "kaznisa", "rrts", "mrc", "opt",
+    "partner", "brand", "multiplicity", "kaznisa_code", "segment",
+    "updated_at", "deleted_at",
+}
+
+
+def _product_dict(p: Product) -> dict:
+    return {
+        "id": p.id, "num": p.num, "article": p.article, "name": p.name,
+        "unit": p.unit, "brand": p.brand, "kaznisa": p.kaznisa,
+        "rrts": p.rrts, "mrc": p.mrc, "opt": p.opt, "partner": p.partner,
+        "multiplicity": p.multiplicity, "kaznisa_code": p.kaznisa_code,
+        "segment": p.segment,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+        "updated_by": p.updated_by,
+        "deleted_at": p.deleted_at.isoformat() if p.deleted_at else None,
+        "deleted_by": p.deleted_by,
+    }
+
+
+def _require_session(current_user):
+    """Изменения базы — только по действующей сессии: в журнале нужно имя."""
+    if current_user is None:
+        raise HTTPException(401, "Сессия истекла — войдите в приложение заново")
+
+
+def _after_products_change() -> None:
+    """Подбор перечитает базу; шаблон с листом БД пересоберётся в фоне."""
+    invalidate_product_cache()
+    schedule_base_template_rebuild()
+
+
+@router.get("/products/browse")
+async def browse_products(
+    segment: str = Query(default="", description="ss/os/sil/gen; пусто — все"),
+    status:  str = Query(default="active", description="active | deleted"),
+    brand:   str = Query(default=""),
+    q:       str = Query(default="", description="Поиск по словам: артикул, наименование, код, бренд"),
+    sort:    str = Query(default="article"),
+    desc:    bool = Query(default=False),
+    limit:   int = Query(default=100, ge=1, le=500),
+    offset:  int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _auth: str = Depends(verify_any_auth),
+):
+    """Просмотр продукции для вкладки «Продукция»."""
+    from sqlalchemy import and_, or_
+    conds = []
+    seg = (segment or "").strip().lower()
+    if seg in KNOWN_SEGMENTS:
+        conds.append(Product.segment == seg)
+    if status == "deleted":
+        conds.append(Product.deleted_at.isnot(None))
+    else:
+        conds.append(Product.is_active == True)        # noqa: E712
+        conds.append(Product.deleted_at.is_(None))
+    if brand.strip():
+        conds.append(Product.brand == brand.strip())
+    # Каждое слово запроса должно найтись хоть в одном поле:
+    # «автомат 16А» — и «автомат», и «16А»
+    for word in (q or "").split():
+        like = f"%{word}%"
+        conds.append(or_(
+            Product.article.ilike(like), Product.name.ilike(like),
+            Product.kaznisa_code.ilike(like), Product.brand.ilike(like),
+        ))
+    where = and_(*conds)
+
+    total = (await db.execute(
+        select(func.count()).select_from(Product).where(where))).scalar() or 0
+
+    col = getattr(Product, sort if sort in _PRODUCT_SORTABLE else "article")
+    order = col.desc().nulls_last() if desc else col.asc().nulls_last()
+    res = await db.execute(
+        select(Product).where(where).order_by(order, Product.id)
+        .offset(offset).limit(limit))
+    return {"items": [_product_dict(p) for p in res.scalars().all()],
+            "total": total, "offset": offset, "limit": limit}
+
+
+@router.get("/products/brands")
+async def product_brands(
+    segment: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+    _auth: str = Depends(verify_any_auth),
+):
+    """Бренды активных позиций сегмента — для фильтра."""
+    q = (select(Product.brand).distinct()
+         .where(Product.is_active == True, Product.deleted_at.is_(None),   # noqa: E712
+                Product.brand.isnot(None), Product.brand != ""))
+    seg = (segment or "").strip().lower()
+    if seg in KNOWN_SEGMENTS:
+        q = q.where(Product.segment == seg)
+    res = await db.execute(q)
+    return {"brands": sorted({b for (b,) in res.all() if b}, key=str.casefold)}
+
+
 @router.patch("/products/{product_id}")
 async def update_product(
     product_id: int,
     data: ProductUpdate,
-    db: AsyncSession = Depends(get_db),
-    _auth: str = Depends(verify_any_auth),
-):
-    result = await db.execute(select(Product).where(Product.id == product_id))
-    product = result.scalar_one_or_none()
-    if not product:
-        raise HTTPException(404, "Товар не найден")
-
-    for field, value in data.model_dump(exclude_none=True).items():
-        setattr(product, field, value)
-
-    await db.commit()
-    return {"status": "updated", "id": product_id}
-
-
-@router.delete("/products/{product_id}")
-async def delete_product(
-    product_id: int,
-    body: AdminRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _key: str = Depends(verify_api_key),
+    current_user=Depends(get_current_user_optional),
 ):
-    check_admin(body.password)
-    result = await db.execute(select(Product).where(Product.id == product_id))
-    product = result.scalar_one_or_none()
+    """Правка позиции из вкладки «Продукция»."""
+    from app.services.product_store import (
+        PRICE_FIELDS, row_key, _record_price_change,
+    )
+    _require_session(current_user)
+    product = (await db.execute(
+        select(Product).where(Product.id == product_id))).scalar_one_or_none()
     if not product:
-        raise HTTPException(404, "Товар не найден")
-    product.is_active = False
+        raise HTTPException(404, "Позиция не найдена")
+    if product.deleted_at is not None:
+        raise HTTPException(409, "Позиция в корзине — сначала верните её")
+
+    patch = data.model_dump(exclude_unset=True)
+    for f in ("article", "name", "unit", "brand", "kaznisa_code"):
+        if f in patch:
+            v = " ".join(str(patch[f] or "").split())
+            patch[f] = v or None
+    for f in PRICE_FIELDS:
+        if f in patch and patch[f] is not None and patch[f] <= 0:
+            raise HTTPException(422, "Цена должна быть больше нуля — или пустая")
+
+    new_article = patch.get("article", product.article)
+    new_name    = patch.get("name", product.name)
+    new_key = row_key(new_article, new_name)
+    if not new_key:
+        raise HTTPException(422, "Нужен артикул или наименование")
+    if new_key != row_key(product.article, product.name):
+        # Новый ключ не должен совпадать с живой позицией того же сегмента
+        same = await db.execute(
+            select(Product.id, Product.article, Product.name)
+            .where(Product.segment == product.segment,
+                   Product.is_active == True, Product.deleted_at.is_(None),  # noqa: E712
+                   Product.id != product.id))
+        for pid, art, nm in same.all():
+            if row_key(art, nm) == new_key:
+                raise HTTPException(
+                    409, f"В этом сегменте уже есть позиция «{new_article or new_name}»")
+
+    old = {f: getattr(product, f) for f in patch}
+    changes = {f: [old[f], v] for f, v in patch.items() if old[f] != v}
+    if not changes:
+        return {"status": "unchanged", "product": _product_dict(product)}
+
+    price_changes = {f: v for f, v in changes.items()
+                     if f in PRICE_FIELDS and v[0] is not None and v[1] is not None}
+    if price_changes:
+        _record_price_change(db, product.segment, {
+            "article": product.article, "name": product.name, "brand": product.brand,
+            "kaznisa": product.kaznisa, "rrts": product.rrts, "mrc": product.mrc,
+            "opt": product.opt,
+        }, price_changes, _actor(current_user))
+
+    for f, (_o, v) in changes.items():
+        setattr(product, f, v)
+    product.updated_by = _actor(current_user) or None
     await db.commit()
-    return {"status": "deleted"}
+    await db.refresh(product)
+
+    ip = request.client.host if request.client else None
+    await write_audit(db, current_user, "product_edit",
+                      resource=f"{product.segment}/{product.article or product.name}",
+                      details=json.dumps({f: [str(o), str(n)] for f, (o, n) in changes.items()},
+                                         ensure_ascii=False)[:1000],
+                      ip=ip)
+    _after_products_change()
+    return {"status": "updated", "product": _product_dict(product)}
+
+
+@router.post("/products/delete")
+async def delete_products(
+    body: ProductIds,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _key: str = Depends(verify_api_key),
+    current_user=Depends(get_current_user_optional),
+):
+    """В корзину: позиция уходит из подбора, но остаётся в базе."""
+    from datetime import datetime, timezone
+    _require_session(current_user)
+    ids = list({int(i) for i in body.ids})[:5000]
+    if not ids:
+        return {"deleted": 0}
+    res = await db.execute(
+        update(Product)
+        .where(Product.id.in_(ids), Product.deleted_at.is_(None))
+        .values(is_active=False, deleted_at=datetime.now(timezone.utc),
+                deleted_by=_actor(current_user) or None)
+    )
+    n = res.rowcount or 0
+    await db.commit()
+    ip = request.client.host if request.client else None
+    await write_audit(db, current_user, "product_delete",
+                      resource="Продукция", details=f"в корзину: {n} поз., id={ids[:50]}",
+                      ip=ip)
+    _after_products_change()
+    return {"deleted": n}
+
+
+@router.post("/products/restore")
+async def restore_products(
+    body: ProductIds,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _key: str = Depends(verify_api_key),
+    current_user=Depends(get_current_user_optional),
+):
+    """Из корзины обратно в базу.
+
+    Если, пока позиция лежала в корзине, такую же завели заново, — не
+    возвращаем: получился бы дубль, и подбор находил бы две одинаковые.
+    """
+    from app.services.product_store import row_key
+    _require_session(current_user)
+    ids = list({int(i) for i in body.ids})[:5000]
+    if not ids:
+        return {"restored": 0, "skipped": []}
+    victims = (await db.execute(
+        select(Product).where(Product.id.in_(ids), Product.deleted_at.isnot(None))
+    )).scalars().all()
+    segs = {p.segment for p in victims}
+    live = set()
+    if segs:
+        rows = await db.execute(
+            select(Product.segment, Product.article, Product.name)
+            .where(Product.segment.in_(segs), Product.is_active == True,   # noqa: E712
+                   Product.deleted_at.is_(None)))
+        live = {(sg, row_key(a, n)) for sg, a, n in rows.all()}
+    restored, skipped = 0, []
+    for p in victims:
+        key = (p.segment, row_key(p.article, p.name))
+        if key in live:
+            skipped.append({"id": p.id, "article": p.article, "name": p.name,
+                            "reason": "такая позиция уже есть в сегменте"})
+            continue
+        p.is_active, p.deleted_at, p.deleted_by = True, None, None
+        p.updated_by = _actor(current_user) or None
+        live.add(key)
+        restored += 1
+    await db.commit()
+    ip = request.client.host if request.client else None
+    await write_audit(db, current_user, "product_restore",
+                      resource="Продукция",
+                      details=f"возвращено: {restored}, пропущено: {len(skipped)}", ip=ip)
+    _after_products_change()
+    return {"restored": restored, "skipped": skipped}
+
+
+@router.post("/products/upsert")
+async def upsert_products_api(
+    body: ProductUpsert,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _key: str = Depends(verify_api_key),
+    current_user=Depends(get_current_user_optional),
+):
+    """Ввод позиций из вкладки «Ввод позиций».
+
+    То же правило, что у импорта из Excel: новые создаются, у существующих
+    меняются только цены, позиции из корзины не трогаются.
+    dry_run=true — только показать, что произойдёт.
+    """
+    from app.services.product_store import upsert_products
+    _require_session(current_user)
+    seg = (body.segment or "").strip().lower()
+    if seg not in KNOWN_SEGMENTS:
+        raise HTTPException(400, f"Неизвестный сегмент: {body.segment}")
+    if len(body.rows) > 20000:
+        raise HTTPException(413, "Слишком много строк за раз — не больше 20 000")
+    res = await upsert_products(db, seg, body.rows,
+                                changed_by=_actor(current_user), dry_run=body.dry_run)
+    if body.dry_run:
+        await db.rollback()
+        return res
+    await db.commit()
+    st = res["stats"]
+    ip = request.client.host if request.client else None
+    await write_audit(db, current_user, "product_upsert",
+                      resource=f"Ввод позиций / {seg}",
+                      details=(f"новых {st['new']}, цены обновлены {st['updated']}, "
+                               f"возвращено {st['restored']}, без изменений {st['same']}, "
+                               f"в корзине {st['deleted']}, ошибок {st['error']}"), ip=ip)
+    if st["new"] or st["updated"] or st["restored"]:
+        _after_products_change()
+    return res
 
 
 # ─── Import ────────────────────────────────────────────────────────────────────
@@ -199,6 +469,13 @@ def _check_excel_file(file: UploadFile):
     name = (file.filename or "").lower()
     if not (name.endswith(".xlsx") or name.endswith(".xlsm")):
         raise HTTPException(400, "Файл должен быть в формате .xlsx или .xlsm")
+
+
+def _actor(user) -> str:
+    """Подпись автора изменения: ФИО, а без него — логин."""
+    if user is None:
+        return ""
+    return (getattr(user, "full_name", "") or getattr(user, "username", "") or "").strip()
 
 
 def _is_admin_user(user) -> bool:
@@ -243,18 +520,21 @@ async def import_products(
     content = await file.read()
     ip = request.client.host if request.client else None
     try:
-        added, updated, no_article = await import_products_from_excel(
+        res = await import_products_from_excel(
             content, db, file.filename, segment=import_segment,
-            changed_by=getattr(current_user, "username", ""),
+            changed_by=_actor(current_user),
         )
+        added, updated, no_article = res["added"], res["updated"], res["no_article"]
     except ValueError as e:
         await write_audit(db, current_user, "import_products",
                           resource=file.filename, details=str(e), ip=ip, status="error")
         raise HTTPException(422, str(e))
     await write_audit(db, current_user, "import_products",
                       resource=file.filename,
-                      details=f"added={added}, updated={updated}, "
-                              f"no_article={no_article}",
+                      details=(f"added={added}, updated={updated}, "
+                               f"restored={res['restored']}, "
+                               f"kept_deleted={res['deleted']}, "
+                               f"no_article={no_article}"),
                       ip=ip)
     # Сохраняем загруженный файл как мастер-шаблон для следующих rebuild
     try:
@@ -268,8 +548,7 @@ async def import_products(
     invalidate_product_cache()
     # Rebuild cached base template in background (non-blocking)
     schedule_base_template_rebuild()   # своя сессия: сессия запроса закроется
-    return {"status": "ok", "added": added, "updated": updated,
-            "no_article": no_article}
+    return {"status": "ok", **res}
 
 
 @router.post("/import/constants")

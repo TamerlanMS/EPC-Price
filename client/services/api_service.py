@@ -513,6 +513,67 @@ class ApiService:
         self._raise_for_status(r)
         return r.json()
 
+    # ── Ведение базы: вкладки «Продукция» и «Ввод позиций» ──────────────────
+
+    def browse_products(self, segment: str = "", status: str = "active",
+                        brand: str = "", q: str = "", sort: str = "article",
+                        desc: bool = False, limit: int = 100, offset: int = 0) -> dict:
+        """GET /database/products/browse → {"items": [...], "total": N}."""
+        r = requests.get(
+            f"{self._base}/api/v1/database/products/browse",
+            params={"segment": segment, "status": status, "brand": brand, "q": q,
+                    "sort": sort, "desc": str(bool(desc)).lower(),
+                    "limit": limit, "offset": offset},
+            headers=self._h, timeout=60,
+        )
+        self._raise_for_status(r)
+        return r.json()
+
+    def product_brands(self, segment: str = "") -> list:
+        r = requests.get(
+            f"{self._base}/api/v1/database/products/brands",
+            params={"segment": segment}, headers=self._h, timeout=30,
+        )
+        self._raise_for_status(r)
+        return r.json().get("brands", [])
+
+    def update_product(self, product_id: int, fields: dict) -> dict:
+        """PATCH /database/products/{id}. Значение None — очистить поле."""
+        r = requests.patch(
+            f"{self._base}/api/v1/database/products/{int(product_id)}",
+            json=fields, headers=self._h, timeout=30,
+        )
+        self._raise_for_status(r)
+        return r.json()
+
+    def delete_products(self, ids: list) -> dict:
+        """В корзину."""
+        r = requests.post(
+            f"{self._base}/api/v1/database/products/delete",
+            json={"ids": [int(i) for i in ids]}, headers=self._h, timeout=60,
+        )
+        self._raise_for_status(r)
+        return r.json()
+
+    def restore_products(self, ids: list) -> dict:
+        """Из корзины."""
+        r = requests.post(
+            f"{self._base}/api/v1/database/products/restore",
+            json={"ids": [int(i) for i in ids]}, headers=self._h, timeout=60,
+        )
+        self._raise_for_status(r)
+        return r.json()
+
+    def upsert_products(self, segment: str, rows: list, dry_run: bool = False) -> dict:
+        """POST /database/products/upsert — ввод позиций (или проверка)."""
+        r = requests.post(
+            f"{self._base}/api/v1/database/products/upsert",
+            json={"segment": segment, "rows": rows, "dry_run": bool(dry_run)},
+            headers=self._h, timeout=300,
+        )
+        self._raise_for_status(r)
+        return r.json()
+
     def get_products_count(self) -> int:
         r = requests.get(
             f"{self._base}/api/v1/database/products/count",

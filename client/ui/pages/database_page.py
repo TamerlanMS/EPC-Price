@@ -184,11 +184,14 @@ class DatabasePage(ctk.CTkFrame):
         )
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=pad, pady=(0, pad))
         self.tabview.add(t("db_tab_import"))
+        self.tabview.add("Продукция")
+        self.tabview.add("Ввод позиций")
         self.tabview.add("Бренды")
         self.tabview.add("Прейскурант")
         self.tabview.add(t("db_tab_logs"))
 
         self._build_import_tab()
+        self._build_products_tabs()
         self._build_brands_tab()
         self._build_pricelist_tab()
         self._build_logs_tab()
@@ -208,6 +211,39 @@ class DatabasePage(ctk.CTkFrame):
         self.status_lbl.grid(row=3, column=0, pady=(0, pad))
 
         self._refresh_count()
+
+    def _build_products_tabs(self):
+        """«Продукция» — просмотр и правка базы, «Ввод позиций» — ввод без Excel."""
+        from ui.pages.products_tab import ProductsTab
+        from ui.pages.product_entry_tab import ProductEntryTab
+
+        user_seg = getattr(self.app.config, "user_segment", "") or ""
+        for name in ("Продукция", "Ввод позиций"):
+            tab = self.tabview.tab(name)
+            tab.grid_rowconfigure(0, weight=1)
+            tab.grid_columnconfigure(0, weight=1)
+
+        self.products_tab = ProductsTab(
+            self.tabview.tab("Продукция"), self.api,
+            on_error=self._handle_api_error, on_changed=self._on_products_changed,
+            default_segment="" if self._is_admin() else user_seg,
+        )
+        self.products_tab.grid(row=0, column=0, sticky="nsew")
+        self.entry_tab = ProductEntryTab(
+            self.tabview.tab("Ввод позиций"), self.api,
+            on_error=self._handle_api_error, on_changed=self._on_products_changed,
+            default_segment=user_seg or "ss",
+        )
+        self.entry_tab.grid(row=0, column=0, sticky="nsew")
+
+    def _on_products_changed(self):
+        """База изменилась из вкладок ведения — счётчик и список устарели."""
+        self._refresh_count()
+        try:
+            if self.tabview.get() != "Продукция":
+                self.products_tab.mark_dirty()
+        except Exception:
+            pass
 
     def _build_import_tab(self):
         _tab_root = self.tabview.tab(t("db_tab_import"))
@@ -2066,6 +2102,19 @@ class DatabasePage(ctk.CTkFrame):
             updated = db_r.get("updated", 0)
             brands  = const_r.get("brands_updated", 0)
             msg = t("db_import_ok", added=added, updated=updated)
+            if db_r.get("restored"):
+                msg += f"\nВозвращено в базу: {db_r['restored']}"
+            if db_r.get("unchanged"):
+                msg += f"\nБез изменений: {db_r['unchanged']}"
+            if db_r.get("deleted"):
+                msg += (f"\nВ корзине, не изменены: {db_r['deleted']}"
+                        " (восстановить — во вкладке «Продукция»)")
+            if db_r.get("count_after") is not None:
+                msg += f"\nВсего в сегменте: {db_r['count_after']:,}".replace(",", " ")
+            try:
+                self.products_tab.mark_dirty()
+            except Exception:
+                pass
             if brands:
                 msg += f"\nКонстанты: обновлено брендов — {brands}"
             self.status_lbl.configure(
@@ -2256,6 +2305,8 @@ class DatabasePage(ctk.CTkFrame):
         """Вызывается при переключении вкладки tabview."""
         try:
             tab_name = self.tabview.get()
+            if tab_name == "Продукция":
+                self.products_tab.on_show()
             if t("db_tab_logs") in tab_name and not self.log_tree.get_children():
                 self._load_logs()
             elif "Бренды" in tab_name and not self._brand_data:
