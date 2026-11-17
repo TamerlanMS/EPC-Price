@@ -29,6 +29,11 @@ config.php
 # Тома и данные контейнеров не версионируются
 postgres_data/
 
+# Рабочие файлы сервера: шаблон собирается на месте при каждом изменении базы
+server/data/base_template.xlsm
+server/data/.base_template.lock
+server/data/*.tmp
+
 # ── IDE и редакторы ───────────────────────────────────────────────────────────
 .idea/
 .vscode/
